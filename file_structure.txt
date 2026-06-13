@@ -1,0 +1,29 @@
+
+Nodal_IPM_Project/
+│
+├── main.py                    # The core entry point that launches the app
+│
+├── core/                      # THE MODEL: Pure math and physics (No GUI code here)
+│   ├── __init__.py
+│   ├── pvt.py                 # Your BlackOilPVT class
+│   ├── vlp.py                 # Your HagedornBrown class and integration loops
+│   ├── ipr.py                 # Vogel/Darcy inflow equations
+│   └── solver.py              # Scipy optimization to cross the curves (Operating Point)
+│
+├── gui/                       # THE VIEW: All user interface components
+│   ├── __init__.py
+│   ├── main_window.py         # Assembles the layout (Sidebar on left, Plot on right)
+│   ├── sidebar.py             # Input text boxes, Run button, and Progress Bar
+│   ├── interactive_plot.py    # Matplotlib canvas embedded into the GUI
+│   └── results_panel.py       # Labels to display the final Operating Point
+│
+├── workers/                   # THE CONTROLLER: Managing background tasks
+│   ├── __init__.py
+│   └── calculation_thread.py  # Critical for the loading bar (prevents GUI freezing)
+│
+├── assets/                    # Static files
+│   ├── app_icon.ico           # The icon for your final .exe file
+│   └── splash_screen.png      # Optional loading image
+│
+├── requirements.txt           # List of your dependencies (numpy, matplotlib, pyqt5, etc.)
+└── build.py                   # PyInstaller script to compile the .exe
