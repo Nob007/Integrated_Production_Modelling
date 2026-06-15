@@ -11,10 +11,10 @@ class HagedornBrown:
 
     def __init__(self, tubing_id, tubing_od, casing_id, roughness, pvt_model,
                  fluid_properties, watercut=0.0, theta=0.0):
-        self.tid      = tubing_id
-        self.tod      = tubing_od
-        self.cid      = casing_id
-        self.roughness = roughness
+        self.tid      = tubing_id #ft
+        self.tod      = tubing_od #ft
+        self.cid      = casing_id #ft
+        self.roughness = roughness #
         self.pvt_model = pvt_model
         self.wc       = watercut
         self.wor      = watercut / (1.0 - watercut + 1e-9)
@@ -225,36 +225,76 @@ class HagedornBrown:
     # Friction factor  (Jain / Colebrook approximation)
     # ------------------------------------------------------------------
 
-    def frictional_factor(self, Hl):
+    def frictional_factor(self, Hl: float) -> float:
         """
-        Calculates the two-phase Darcy friction factor.
+        Calculates the two-phase Darcy friction factor using the Jain (1976)
+        explicit approximation to the Colebrook-White equation.
+
+        Uses the standard oilfield Re definition:
+            Re = 1488 * rho_ns [lbm/ft³] * Vm [ft/s] * d [ft] / mu_m [cp]
 
         Args:
-            Hl (float): Liquid holdup already computed for this step.
+            Hl (float): Liquid holdup fraction (dimensionless), passed in from
+                    calculate_gradient() to avoid a redundant holdup call.
 
         Returns:
-            float: Darcy friction factor (dimensionless).
+            float: Darcy-Weisbach friction factor (dimensionless).
         """
-        # BUG FIX — double holdup call removed.
-        # The original frictional_factor() called self.liquid_holdup() internally,
-        # so calculate_gradient() triggered two full holdup computations per step:
-        # one from the explicit self.liquid_holdup() call and one hidden inside here.
-        # Hl is now passed in from calculate_gradient() to keep a single code path.
         lambda_l = self.fp["Vsl"] / max(self.fp["Vm"], 1e-6)
-        self.fp["rho_ns"] = (self.fp["rho_l"] * lambda_l
-                             + self.fp["rho_g"] * (1.0 - lambda_l))
 
-        Re = (2.2e-2 * self.Ql * self.fp["M"]
-              / (self.tid
-                 * self.fp["mu_l"] ** Hl
-                 * self.fp["mu_g"] ** (1.0 - Hl)))
+    # No-slip mixture density — weighted by input-liquid fraction [lbm/ft³]
+        self.fp["rho_ns"] = (
+        self.fp["rho_l"] * lambda_l
+        + self.fp["rho_g"] * (1.0 - lambda_l)
+        )
 
+    # Hagedorn-Brown mixture viscosity — weighted exponential [cp]
+        mu_m = (
+        self.fp["mu_l"] ** Hl
+        * self.fp["mu_g"] ** (1.0 - Hl)
+        )
+
+    # ── BUG FIX 1 ────────────────────────────────────────────────────────
+    # Original code used  2.2e-2 * Ql * fp["M"] / (tid * mu_m)
+    # which is dimensionally wrong (lbm²/day² in the numerator, not a
+    # velocity × density product). The correct oilfield Reynolds number is:
+    #
+    #   Re = 1488 * rho [lbm/ft³] * Vm [ft/s] * D [ft] / mu [cp]
+    #
+    # The constant 1488 converts:  (lbm/ft³)(ft/s)(ft) / cp  →  dimensionless
+    # i.e.  1 cp = 6.72e-4 lbm/(ft·s),  and  1/6.72e-4 ≈ 1488.
+    # ─────────────────────────────────────────────────────────────────────
+        Re = (
+        1488.0
+        * self.fp["rho_ns"]   # [lbm/ft³]
+        * self.fp["Vm"]       # [ft/s]
+        * self.tid            # [ft]
+        / mu_m                # [cp]
+        )
+
+    # Laminar regime — exact Hagen-Poiseuille result
         if Re < 2000:
             return 64.0 / max(Re, 1.0)
-        else:
-            return (1.14 - 2.0 * np.log10(
-                self.roughness + 21.25 / (Re ** 0.9)
-            )) ** -2
+
+    # ── BUG FIX 2 ────────────────────────────────────────────────────────
+    # Original code passed  self.roughness  (absolute roughness, ft) directly
+    # into the Jain log term.  Jain / Colebrook-White require the
+    # RELATIVE roughness  e/D  (dimensionless).  At typical values:
+    #
+    #   e = 0.0006 ft,  D = 0.2034 ft  →  e/D ≈ 0.00295
+    #
+    # Passing 0.0006 instead of 0.00295 gives a roughness ~5× too low,
+    # producing an underestimated friction factor in the turbulent regime.
+    # ─────────────────────────────────────────────────────────────────────
+        relative_roughness = self.roughness / self.tid   # dimensionless [ft/ft]
+
+    # Jain (1976) explicit approximation — accurate to ±1 % for
+    # Re ∈ [3 000, 4×10⁸] and e/D ∈ [4×10⁻⁵, 0.05].
+    # This covers virtually every wellbore multiphase flow condition,
+    # so there is no practical need to iterate Colebrook-White here.
+        f = (1.14 - 2.0 * np.log10(relative_roughness + 21.25 / (Re ** 0.9))) ** -2
+
+        return f
 
     # ------------------------------------------------------------------
     # Pressure gradient

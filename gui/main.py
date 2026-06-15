@@ -30,6 +30,7 @@ from core.pvt import BlackOilPVT
 from core.ipr import composite_ipr
 from core.vlp import HagedornBrown
 from core.ipr import darcy_ipr
+from core.solver_other import find_operating_points
 
 # ── Qt ────────────────────────────────────────────────────────────────────────
 from PyQt6.QtCore import (
@@ -316,43 +317,63 @@ class AnalysisWorker(QRunnable):
                 pwf_vlp.append(_vlp_pwf(vlp, p, float(q)))
 
             # ── Find operating point ─────────────────────────────────────────
-            self.signals.status.emit("⏳  Finding operating point (Brent bisection)…")
+            self.signals.status.emit("⏳  Finding operating points…")
             sol: dict = {
                 "success": False, "operating_rate": None,
-                "operating_pwf": None, "message": "",
+                "operating_pwf": None, "message": "", "all_points": []
             }
             traverse_depths: list = []
             traverse_pressures: list = []
 
             q_lo, q_hi = float(p["q_min"]), float(p["q_max"])
 
-            def objective(q: float) -> float:
-                return ipr.calculate_Pwf(q) - _vlp_pwf(vlp, p, q)
-
             try:
-                f_lo = objective(q_lo)
-                f_hi = objective(q_hi)
+                vlp_params_dict = {
+                    "Pth": p["thp"],
+                    "surface_temp": p["T_surface"],
+                    "bottomhole_temp": p["T_bh"],
+                    "depth": p["depth"],
+                    "step_size": p["dz_step"]
+                }
+                
+                nodal_result = find_operating_points(
+                    ipr_model=ipr,
+                    vlp_model=vlp,
+                    vlp_params=vlp_params_dict,
+                    pr=p["Pr"],
+                    q_min=q_lo,
+                    q_max=q_hi,
+                    xtol=0.1
+                )
 
-                if f_lo * f_hi > 0:
-                    sol["message"] = (
-                        "Well cannot flow — VLP pressure exceeds IPR across entire rate range."
-                        if f_lo > 0
-                        else "Operating point exceeds AOF — widen the rate range."
-                    )
+                if not nodal_result.success:
+                    sol["message"] = nodal_result.failure_reason
                 else:
-                    q_star = brentq(objective, q_lo, q_hi, xtol=0.1, rtol=1e-5)
-                    p_star = ipr.calculate_Pwf(q_star)
-                    sol.update(success=True, operating_rate=q_star,
-                               operating_pwf=p_star, message="Converged.")
+                    op_point = nodal_result.stable_point
+                    if op_point is None:
+                        op_point = nodal_result.unstable_point
+                    if op_point is None and nodal_result.all_points:
+                        op_point = nodal_result.all_points[0]
 
-                    # Pressure traverse at operating rate (for mini-map)
-                    self.signals.status.emit(
-                        f"⏳  Computing pressure traverse at q* = {q_star:.1f} STB/d…")
-                    traverse_depths, traverse_pressures = vlp.calculate_pressure_traverse(
-                        Pth=p["thp"], surface_temp=p["T_surface"],
-                        bottomhole_temp=p["T_bh"], total_depth=p["depth"],
-                        step_size=p["dz_step"], Ql=q_star,
-                    )
+                    if op_point:
+                        q_star = op_point.rate
+                        p_star = op_point.pwf
+                        sol.update(
+                            success=True, 
+                            operating_rate=q_star,
+                            operating_pwf=p_star, 
+                            message="Converged.",
+                            all_points=[(pt.rate, pt.pwf, pt.stability.value) for pt in nodal_result.all_points]
+                        )
+
+                        # Pressure traverse at operating rate (for mini-map)
+                        self.signals.status.emit(
+                            f"⏳  Computing pressure traverse at q* = {q_star:.1f} STB/d…")
+                        traverse_depths, traverse_pressures = vlp.calculate_pressure_traverse(
+                            Pth=p["thp"], surface_temp=p["T_surface"],
+                            bottomhole_temp=p["T_bh"], total_depth=p["depth"],
+                            step_size=p["dz_step"], Ql=q_star,
+                        )
             except Exception as solve_err:
                 sol["message"] = str(solve_err)
 
@@ -568,6 +589,8 @@ class ChartWidget(QWidget):
         self._ipr_p: list = []
         self._vlp_q: list = []
         self._vlp_p: list = []
+        self._ipr_line = None
+        self._vlp_line = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 4, 8, 0)
@@ -684,28 +707,49 @@ class ChartWidget(QWidget):
     # ── hover tooltip ────────────────────────────────────────────────────────
 
     def _on_hover(self, ev) -> None:
-        if ev.inaxes != self.ax or not self._ipr_q:
-            self._tip.hide()
-            return
-        q = ev.xdata
-        if q is None:
+        if ev.inaxes != self.ax:
             self._tip.hide()
             return
 
-        idx = int(np.argmin(np.abs(np.array(self._ipr_q) - q)))
-        p_i = self._ipr_p[idx] if idx < len(self._ipr_p) else 0.0
-        parts = [f"q = {q:.0f} STB/d", f"IPR: {p_i:.0f} psia"]
+        if ev.x is None or ev.y is None:
+            self._tip.hide()
+            return
 
-        if self._vlp_q:
-            idx2 = int(np.argmin(np.abs(np.array(self._vlp_q) - q)))
-            p_v  = self._vlp_p[idx2] if idx2 < len(self._vlp_p) else 0.0
-            parts.append(f"VLP: {p_v:.0f} psia")
+        lines = []
+        if self._ipr_line: lines.append((self._ipr_line, "IPR"))
+        if self._vlp_line: lines.append((self._vlp_line, "VLP"))
+        for sl in self._sens_lines:
+            lines.append((sl, sl.get_label()))
 
-        self._tip.setText("  |  ".join(parts))
+        best_dist = 20.0  # snapping threshold in pixels
+        best_data = None
+        
+        for line, label in lines:
+            xdata, ydata = line.get_data()
+            if len(xdata) == 0: continue
+            
+            xy = np.column_stack((xdata, ydata))
+            xy_disp = self.ax.transData.transform(xy)
+            
+            dx = xy_disp[:, 0] - ev.x
+            dy = xy_disp[:, 1] - ev.y
+            dist = np.hypot(dx, dy)
+            
+            idx = np.argmin(dist)
+            if dist[idx] < best_dist:
+                best_dist = dist[idx]
+                best_data = (xdata[idx], ydata[idx], label)
+
+        if best_data is None:
+            self._tip.hide()
+            return
+            
+        q, p, label = best_data
+        self._tip.setText(f"{label}:  q = {q:.0f} STB/d  |  Pwf = {p:.0f} psia")
         self._tip.adjustSize()
-        disp = self.ax.transData.transform((ev.xdata, ev.ydata))
-        cx = min(int(disp[0]) + 14, self.canvas.width() - self._tip.width() - 4)
-        cy = max(self.canvas.height() - int(disp[1]) + 4, 4)
+        
+        cx = min(int(ev.x) + 14, self.canvas.width() - self._tip.width() - 4)
+        cy = max(self.canvas.height() - int(ev.y) + 4, 4)
         self._tip.move(cx, cy)
         self._tip.show()
 
@@ -724,19 +768,30 @@ class ChartWidget(QWidget):
         self._ipr_q, self._ipr_p = ri, pi
         self._vlp_q, self._vlp_p = rv, pv
 
-        self.ax.plot(ri, pi, color=C_RED,  linewidth=2.5,
-                     solid_capstyle="round", label="IPR")
-        self.ax.plot(rv, pv, color=C_BLUE, linewidth=2.5,
-                     solid_capstyle="round", label="VLP")
+        self._ipr_line, = self.ax.plot(ri, pi, color=C_RED,  linewidth=2.5,
+                                       solid_capstyle="round", label="IPR")
+        self._vlp_line, = self.ax.plot(rv, pv, color=C_BLUE, linewidth=2.5,
+                                       solid_capstyle="round", label="VLP")
 
         if sol["success"]:
-            qs, ps = sol["operating_rate"], sol["operating_pwf"]
-            self.ax.plot(
-                qs, ps,
-                marker="*", markersize=16, color=C_GOLD, zorder=10,
-                linestyle="None",
-                markeredgecolor="#C67C00", markeredgewidth=0.8,
-            )
+            if sol.get("all_points"):
+                for q_val, p_val, stab in sol["all_points"]:
+                    is_stable = stab == "Stable"
+                    self.ax.plot(
+                        q_val, p_val,
+                        marker="*" if is_stable else "o", markersize=16 if is_stable else 8,
+                        color=C_GOLD if is_stable else C_RED, zorder=10,
+                        linestyle="None",
+                        markeredgecolor="#C67C00" if is_stable else "#B71C1C", markeredgewidth=0.8,
+                    )
+            else:
+                qs, ps = sol["operating_rate"], sol["operating_pwf"]
+                self.ax.plot(
+                    qs, ps,
+                    marker="*", markersize=16, color=C_GOLD, zorder=10,
+                    linestyle="None",
+                    markeredgecolor="#C67C00", markeredgewidth=0.8,
+                )
 
         # Auto-scale
         all_q = ri + rv
@@ -930,10 +985,10 @@ class VlpSection(QWidget):
             "Hagedron-Brown", "Duns and Ross (soon)", "Beggs and Brill (soon)"])
         lay.addWidget(_row("VLP Model", self.model))
 
-        self.tid   = _dspin(0.2034, 0.05, 0.50,    0.001,  4)
-        self.tod   = _dspin(0.2396, 0.05, 0.60,    0.001,  4)
-        self.cid   = _dspin(0.5042, 0.10, 1.50,    0.001,  4)
-        self.rough = _dspin(0.0006, 0.0,  0.01,    0.0001, 5)
+        self.tid   = _dspin(2.441, 0.5, 5.5,    0.1,  3)
+        self.tod   = _dspin(2.875, 0.5, 6,    0.1,  3)
+        self.cid   = _dspin(5.5, 0.10, 20.5,    0.1,  3)
+        self.rough = _dspin(0.0006, 0.0,  1,    0.0001, 5)
         self.thp   = _dspin(346.6,  0.0,  5000.0,  10.0,   1)
         self.depth = _dspin(8244.0, 100,  30000,   50.0,   1)
         self.t_sf  = _dspin(80.0,   -20,  200,     1.0,    1)
@@ -941,10 +996,10 @@ class VlpSection(QWidget):
         self.gor   = _dspin(480.0,  0,    10000,   10.0,   1)
         self.theta = _dspin(0.0,    0,    90,      1.0,    1)
 
-        lay.addWidget(_row("Tubing ID",  self.tid,   "ft"))
-        lay.addWidget(_row("Tubing OD",  self.tod,   "ft"))
-        lay.addWidget(_row("Casing ID",  self.cid,   "ft"))
-        lay.addWidget(_row("Roughness",  self.rough, "ft"))
+        lay.addWidget(_row("Tubing ID",  self.tid,   "in"))
+        lay.addWidget(_row("Tubing OD",  self.tod,   "in"))
+        lay.addWidget(_row("Casing ID",  self.cid,   "in"))
+        lay.addWidget(_row("Roughness",  self.rough, "in"))
         lay.addWidget(_row("THP",        self.thp,   "psia"))
         lay.addWidget(_row("TVD",        self.depth, "ft"))
         lay.addWidget(_row("T Surface",  self.t_sf,  "°F"))
@@ -955,10 +1010,10 @@ class VlpSection(QWidget):
     def values(self) -> dict:
         return {
             "model":     self.model.currentText(),
-            "tubing_id": self.tid.value(),
-            "tubing_od": self.tod.value(),
-            "casing_id": self.cid.value(),
-            "roughness": self.rough.value(),
+            "tubing_id": self.tid.value()/12,
+            "tubing_od": self.tod.value()/12,
+            "casing_id": self.cid.value()/12,
+            "roughness": self.rough.value()/12,
             "thp":       self.thp.value(),
             "depth":     self.depth.value(),
             "T_surface": self.t_sf.value(),
@@ -1241,10 +1296,12 @@ class MainWindow(QMainWindow):
 
         if sol["success"]:
             q, p = sol["operating_rate"], sol["operating_pwf"]
+            pts_count = len(sol.get("all_points", []))
+            pts_str = f" ({pts_count} intersections found)" if pts_count > 1 else ""
             self._status(
                 f"✅  Operating Point:  q* = {q:.1f} STB/day"
                 f"  |  Pwf* = {p:.1f} psia"
-                f"  |  Method: Brent bisection",
+                f"  |  Method: Nodal Analysis{pts_str}",
                 C_INK,
             )
         else:
