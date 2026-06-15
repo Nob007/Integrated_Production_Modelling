@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-class IPR:
+class composite_ipr:
     """
     Calculates and plots the Inflow Performance Relationship (IPR) using the 
     Composite Darcy-Vogel model for undersaturated and saturated oil reservoirs.
@@ -113,6 +113,49 @@ class IPR:
         plt.scatter(self.q_bp, self.Pb, color='blue', marker='x', s=100, zorder=5, label='Bubble Point Transition')
         
         plt.title('Inflow Performance Relationship (IPR)', fontweight='bold')
+        plt.xlabel('Liquid Flow Rate, q (STB/day)')
+        plt.ylabel('Bottom-Hole Flowing Pressure, Pwf (psia)')
+        plt.ylim(bottom=0)
+        plt.xlim(left=0)
+        
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.show()
+
+class darcy_ipr:
+    """
+    Simple linear Darcy IPR model for comparison and testing purposes.
+    """
+
+    def __init__(self, Pr, Pb, q_test, Pwf_test):
+        self.Pr = Pr
+        self.Pb = Pb
+        self.q_test = q_test
+        self.Pwf_test = Pwf_test
+        self.J = self._calculate_pi(q_test, Pwf_test)
+        self.q_max = self.J * self.Pr  # Absolute Open Flow at Pwf=0
+
+    def _calculate_pi(self, q_test, Pwf_test):
+        return q_test / (self.Pr - Pwf_test)
+
+    def calculate_q(self, Pwf):
+        return self.J * (self.Pr - Pwf)
+
+    def calculate_Pwf(self, q):
+        return self.Pr - (q / self.J)
+    
+    def _calculate_aof(self):
+        return self.q_max  # For Darcy, AOF is simply J * Pr
+
+    def plot_ipr(self, points=50):
+        Q = np.linspace(0, self.q_max, points)
+        Pwf_points = [self.calculate_Pwf(q) for q in Q]
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(Q, Pwf_points, label='Darcy IPR Curve', color='navy', linewidth=2)
+        plt.scatter(self.q_test, self.Pwf_test, color='black', zorder=5, label='Well Test Data Point')
+        
+        plt.title('Darcy Inflow Performance Relationship (IPR)', fontweight='bold')
         plt.xlabel('Liquid Flow Rate, q (STB/day)')
         plt.ylabel('Bottom-Hole Flowing Pressure, Pwf (psia)')
         plt.ylim(bottom=0)
