@@ -39,7 +39,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QColor, QFontDatabase
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout,
-    QLabel, QMainWindow, QPushButton, QScrollArea, QSizePolicy,
+    QLabel, QListView, QMainWindow, QPushButton, QScrollArea, QSizePolicy, # <-- Added QListView
     QSpinBox, QSplitter, QStatusBar, QToolButton, QVBoxLayout,
     QWidget,
 )
@@ -102,18 +102,30 @@ QToolButton#section_header:hover {{ background: #BBDEFB; }}
 QDoubleSpinBox, QSpinBox, QComboBox {{
     border: 1px solid {C_BORDER}; border-radius: 5px;
     padding: 4px 8px; background: {C_WHITE};
+    color: {C_INK};
     selection-background-color: {C_BLUE};
+    selection-color: {C_WHITE};
     min-height: 26px;
 }}
 QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {{
     border: 1.5px solid {C_BLUE};
 }}
 QComboBox::drop-down {{ border: none; width: 20px; }}
-QComboBox QAbstractItemView {{
+QComboBox QAbstractItemView, QComboBox QListView {{
     border: 1px solid {C_BORDER};
+    background: {C_WHITE};
+    color: {C_INK};
     selection-background-color: {C_BLUE_LIGHT};
     selection-color: {C_NAVY};
-    background: {C_WHITE};
+    outline: none;
+}}
+QComboBox QAbstractItemView::item {{
+    min-height: 24px;
+    color: {C_INK};
+}}
+QComboBox QAbstractItemView::item:selected {{
+    background: {C_BLUE_LIGHT};
+    color: {C_NAVY};
 }}
 
 /* ── Read-only output labels ─────────────────────────────── */
@@ -215,12 +227,19 @@ def _build_pvt_vlp(p: dict) -> tuple[BlackOilPVT, HagedornBrown]:
     )
     # Initial fluid properties at tubing head conditions
     fp0 = pvt.fluid_properties_dict(p["thp"], p["T_surface"], p["gor"])
-    vlp = HagedornBrown(
-        tubing_id=p["tubing_id"], tubing_od=p["tubing_od"],
-        casing_id=p["casing_id"], roughness=p["roughness"],
-        pvt_model=pvt, fluid_properties=fp0,
-        watercut=p["wc"], theta=p["theta"],
-    )
+    if p["model"] == "Hagedron-Brown":
+        vlp = HagedornBrown(
+            tubing_id=p["tubing_id"], tubing_od=p["tubing_od"],
+            casing_id=p["casing_id"], roughness=p["roughness"],
+            pvt_model=pvt, fluid_properties=fp0,
+            watercut=p["wc"], theta=p["theta"],
+        )
+    # vlp = HagedornBrown(
+    #     tubing_id=p["tubing_id"], tubing_od=p["tubing_od"],
+    #     casing_id=p["casing_id"], roughness=p["roughness"],
+    #     pvt_model=pvt, fluid_properties=fp0,
+    #     watercut=p["wc"], theta=p["theta"],
+    # )
     return pvt, vlp
 
 
@@ -457,17 +476,12 @@ class CollapsibleSection(QWidget):
 
 class MiniMap(QFrame):
     """
-    Semi-transparent 180×220 px pressure traverse mini-plot.
-    Expands / collapses to 360×440 px via ⤢ button.
+    Semi-transparent 250×310 px pressure traverse mini-plot.
     """
-
-    SZ_SMALL = QSize(185, 230)
-    SZ_LARGE = QSize(370, 455)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._big = False
-        self.setFixedSize(self.SZ_SMALL)
+        self.setFixedSize(QSize(250, 310))
         self.setStyleSheet(f"""
             QFrame {{
                 background: rgba(255, 255, 255, 235);
@@ -480,26 +494,18 @@ class MiniMap(QFrame):
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(2)
 
-        # Header row: title + expand button
+        # Header row: title
         hdr = QHBoxLayout()
         title_lbl = QLabel("Traverse @ q*")
         title_lbl.setStyleSheet(
             f"font-size: 9pt; font-weight: 700; color: {C_BLUE}; "
             "background: transparent; border: none;")
-        self._exp_btn = QPushButton("⤢")
-        self._exp_btn.setFixedSize(18, 18)
-        self._exp_btn.setToolTip("Expand / collapse traverse mini-map")
-        self._exp_btn.setStyleSheet(
-            f"background: transparent; border: none; color: {C_BLUE}; "
-            "font-size: 12px; padding: 0;")
-        self._exp_btn.clicked.connect(self._toggle)
         hdr.addWidget(title_lbl)
         hdr.addStretch()
-        hdr.addWidget(self._exp_btn)
         lay.addLayout(hdr)
 
         # Mini matplotlib figure
-        self.fig = Figure(figsize=(1.7, 2.1), dpi=80)
+        self.fig = Figure(figsize=(2.4, 2.8), dpi=80)
         self.fig.patch.set_facecolor("white")
         self.ax = self.fig.add_subplot(111)
         self._blank()
@@ -543,21 +549,6 @@ class MiniMap(QFrame):
         self.ax.set_xticks([])
         self.ax.set_yticks([])
         self.fig.tight_layout(pad=0.5)
-
-    def _toggle(self) -> None:
-        self._big = not self._big
-        target = self.SZ_LARGE if self._big else self.SZ_SMALL
-        self.setFixedSize(target)
-        self._exp_btn.setText("⤡" if self._big else "⤢")
-
-        w_in = target.width() / 96.0
-        h_in = target.height() / 96.0
-        self.fig.set_size_inches(w_in - 0.2, h_in - 0.4)
-        self.canvas.draw_idle()
-
-        # Reposition within parent (parent's resizeEvent also does this)
-        if self.parent():
-            self.parent().update()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -806,15 +797,18 @@ class IprSection(QWidget):
 
         # Model selector
         self.model = QComboBox()
+        view = QListView()
+        view.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.model.setView(view)
         self.model.addItems([
-            "Composite", "Vogel", "Darcy", "Fetkovitch"])
+            "Composite", "Vogel (soon)", "Darcy", "Fetkovitch (soon)"])
         lay.addWidget(_row("IPR Model", self.model))
 
         # Inputs
-        self.pr  = _dspin(2500.0, 0, 20000, 50,  1)
-        self.pwf = _dspin(1000.0, 0, 20000, 50,  1)
-        self.pb  = _dspin(2800.0, 0, 20000, 50,  1)
-        self.qt  = _dspin(500.0,  0, 50000, 50,  1)
+        self.pr  = _dspin(2500.0, 0, 20000, 50,  2)
+        self.pwf = _dspin(1000.0, 0, 20000, 50,  2)
+        self.pb  = _dspin(2800.0, 0, 20000, 50,  2)
+        self.qt  = _dspin(500.0,  0, 50000, 50,  2)
 
         lay.addWidget(_row("Pr",          self.pr,  "psia"))
         self._pb_row = _row("Pb",         self.pb,  "psia")
@@ -839,19 +833,26 @@ class IprSection(QWidget):
         self._on_model()
 
     def _on_model(self) -> None:
-        darcy = self.model.currentText() == "Darcy (linear)"
+        darcy = self.model.currentText() == "Darcy"
         self._pb_row.setVisible(not darcy)
-        self._qt_row.setVisible(not darcy)
+        # self._qt_row.setVisible(not darcy)
         self._live()
 
     def _live(self) -> None:
         """Update AOF and PI live without running the full analysis."""
         try:
-            ipr = composite_ipr(
-                Pr=self.pr.value(), Pb=self.pb.value(),
-                q_test=self.qt.value(), Pwf_test=self.pwf.value())
-            self.aof_lbl.setText(f"{ipr.q_max:.1f}")
-            self.pi_lbl.setText(f"{ipr.J:.4f}")
+            if self.model.currentText() == "Composite":
+                ipr = composite_ipr(
+                    Pr=self.pr.value(), Pb=self.pb.value(),
+                    q_test=self.qt.value(), Pwf_test=self.pwf.value())
+                self.aof_lbl.setText(f"{ipr.q_max:.1f}")
+                self.pi_lbl.setText(f"{ipr.J:.4f}")
+            elif self.model.currentText() == "Darcy":
+                ipr = darcy_ipr(
+                    Pr=self.pr.value(), Pb=self.pr.value() * 1.001,
+                    q_test=self.qt.value(), Pwf_test=self.pwf.value())
+                self.aof_lbl.setText("∞")
+                self.pi_lbl.setText(f"{ipr.J:.4f}")
         except Exception:
             self.aof_lbl.setText("—")
             self.pi_lbl.setText("—")
@@ -921,6 +922,14 @@ class VlpSection(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
 
+        self.model = QComboBox()
+        view = QListView()
+        view.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.model.setView(view)
+        self.model.addItems([
+            "Hagedron-Brown", "Duns and Ross (soon)", "Beggs and Brill (soon)"])
+        lay.addWidget(_row("VLP Model", self.model))
+
         self.tid   = _dspin(0.2034, 0.05, 0.50,    0.001,  4)
         self.tod   = _dspin(0.2396, 0.05, 0.60,    0.001,  4)
         self.cid   = _dspin(0.5042, 0.10, 1.50,    0.001,  4)
@@ -945,6 +954,7 @@ class VlpSection(QWidget):
 
     def values(self) -> dict:
         return {
+            "model":     self.model.currentText(),
             "tubing_id": self.tid.value(),
             "tubing_od": self.tod.value(),
             "casing_id": self.cid.value(),
