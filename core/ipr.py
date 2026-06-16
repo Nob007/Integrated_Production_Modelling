@@ -54,7 +54,7 @@ class composite_ipr:
         Returns:
             float: Maximum flow rate (q_max) in STB/day.
         """
-        return self.q_bp + (self.J * self.Pb) / 1.8
+        return self.q_test/(1 - 0.2 * (self.Pwf_test / self.Pr) - 0.8 * (self.Pwf_test / self.Pr)**2)
 
     def calculate_q(self, Pwf):
         """

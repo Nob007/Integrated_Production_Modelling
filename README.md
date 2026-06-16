@@ -1,6 +1,6 @@
 # Nodal Analysis — Integrated Production Modelling (IPM)
 
-A robust, Python-based desktop application for petroleum engineers to perform Nodal Analysis. This application calculates and visualizes the intersection of Inflow Performance Relationship (IPR) and Vertical Lift Performance (VLP) curves to find the stable operating point of a well.
+A robust, Python-based desktop application for petroleum engineers to perform Nodal Analysis. This application calculates and visualizes the intersection of Inflow Performance Relationship (IPR) and Vertical Lift Performance (VLP) curves to find the operating point(s) of a well and diagnose flow stability.
 
 ![Theme](https://img.shields.io/badge/Theme-White_%26_Blue-1565C0)
 ![GUI](https://img.shields.io/badge/GUI-PyQt6-brightgreen)
@@ -9,10 +9,10 @@ A robust, Python-based desktop application for petroleum engineers to perform No
 ## ✨ Features
 
 ### 📉 Reservoir & Wellbore Modelling
-*   **IPR Models**: Supports Composite (Darcy/Vogel), pure Vogel, Darcy (Linear), and Fetkovitch models. Automatically handles the bubble point transition.
-*   **VLP Models**: Hagedorn-Brown multiphase flow correlation with Griffith-Wallis bubble flow detection and accurate liquid holdup corrections. Duns and Ross correlation. Beggs and Brills correlation
+*   **IPR Models**: Supports Composite (Darcy/Vogel) and Darcy (Linear) models, with pure Vogel and Fetkovitch models planned for future releases. Automatically handles the bubble point transition.
+*   **VLP Models**: Hagedorn-Brown multiphase flow correlation with Griffith-Wallis bubble flow detection and accurate liquid holdup corrections. Duns and Ross, and Beggs and Brill correlations are coming soon.
 *   **Black Oil PVT**: Automatically calculates fluid properties (Z-factor, Rs, Bo, Bg, Bw, viscosities, and densities) across the wellbore using industry-standard correlations (Standing, Beggs-Robinson, Lee-Gonzalez-Eakin, Dranchuk-Abou-Kassem).
-*   **Solver**: Utilizes Scipy's highly reliable Brent's method (`brentq`) to pinpoint operating points accurately.
+*   **Solver & Stability Analysis**: Utilizes an advanced nodal solver based on SciPy's Brent's method (`brentq`) to pinpoint *multiple* operating points accurately. Crucially, it evaluates the local derivatives (IPR vs VLP slopes) to classify each equilibrium point as **Stable**, **Unstable**, or **Indeterminate**.
 
 ### 🖥️ Interactive User Interface
 *   **Modern Design**: Clean white and blue accent theme built with PyQt6.
@@ -34,7 +34,8 @@ Nodal_IPM_Project/
 │   ├── pvt.py                 # BlackOilPVT class & correlations
 │   ├── vlp.py                 # HagedornBrown multiphase wellbore integration
 │   ├── ipr.py                 # Darcy & Vogel inflow equations
-│   └── solver.py              # Root-finding optimizer for Operating Point
+│   ├── solver.py              # Base root-finding optimizer for Operating Point
+│   └── solver_other.py        # Advanced multi-point stability solver
 │
 ├── gui/                       # User interface components
 │   ├── __init__.py
@@ -68,7 +69,7 @@ python main.py
 2. Expand the **Fluid Properties** section and define Specific Gravities and Water Cut.
 3. Expand the **VLP — Wellbore** section and input tubular geometry, Tubing Head Pressure (THP), TVD, and temperatures.
 4. Click the **▶ Run Analysis** button at the top right of the window.
-5. View the Operating Point ($q^*$, $P_{wf}^*$) plotted on the chart and summarized in the status bar at the bottom.
+5. View the Operating Point(s) ($q^*$, $P_{wf}^*$) plotted on the chart and summarized in the status bar. The app will visually distinguish stable operating points (gold stars) from unstable ones (red circles).
 
 ## 🛠️ Building the Executable
 

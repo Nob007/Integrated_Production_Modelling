@@ -906,7 +906,7 @@ class IprSection(QWidget):
                 ipr = darcy_ipr(
                     Pr=self.pr.value(), Pb=self.pr.value() * 1.001,
                     q_test=self.qt.value(), Pwf_test=self.pwf.value())
-                self.aof_lbl.setText("∞")
+                self.aof_lbl.setText(f"{ipr.q_max:.1f}")
                 self.pi_lbl.setText(f"{ipr.J:.4f}")
         except Exception:
             self.aof_lbl.setText("—")
