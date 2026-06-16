@@ -162,15 +162,20 @@ class HagedornBrown:
     # Hagedorn-Brown holdup (slug / transition / mist)
     # ------------------------------------------------------------------
 
-    def liquid_holdup(self):
+    def liquid_holdup(self, Nl, CNl, Nlv, Ngv, Nd):
         """
         Calculates liquid holdup using the Hagedorn-Brown correlation.
         Also sets rho_m and mu_m in self.fp.
+        Args:
+            Liquid viscosity no
+            CNl
+            Nlv
+            Ngv, 
+            Nd
 
         Returns:
             float: Liquid holdup (0.0 – 1.0).
         """
-        Nl, CNl, Nlv, Ngv, Nd = self.dimensionless_numbers()
         Ngv_safe = max(Ngv, 1e-6)
 
         H = ((Nlv / (Ngv_safe ** 0.575))
@@ -214,12 +219,12 @@ class HagedornBrown:
         # dimensionless_numbers() populates Vsl, Vsg, Vm — required by is_bubble_flow()
         # liquid_holdup() calls dimensionless_numbers() again internally, but
         # self.fp velocities are already set so the second call is consistent.
-        self.dimensionless_numbers()
+        Nl, CNl, Nlv, Ngv, Nd = self.dimensionless_numbers()
 
         if self.is_bubble_flow():
             return self.griffith_holdup()
         else:
-            return self.liquid_holdup()
+            return self.liquid_holdup(Nl, CNl, Nlv, Ngv, Nd)
 
     # ------------------------------------------------------------------
     # Friction factor  (Jain / Colebrook approximation)

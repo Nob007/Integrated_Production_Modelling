@@ -267,10 +267,10 @@ def _build_ipr(p: dict) -> composite_ipr:
 
     if model == "Darcy":
         # Force Pb >> Pr so the entire curve stays in the linear Darcy region
-        return darcy_ipr(Pr=Pr, Pb=Pr * 1.001, q_test=qt, Pwf_test=pwft)
+        return darcy_ipr(Pr=Pr, Pb=Pb, q_test=qt, Pwf_test=pwft)
     elif model == "Composite":
         # Pure Vogel: set Pb = Pr so the entire curve uses the Vogel equation
-        return composite_ipr(Pr=Pr, Pb=Pr, q_test=qt, Pwf_test=pwft)
+        return composite_ipr(Pr=Pr, Pb=Pb, q_test=qt, Pwf_test=pwft)
     elif model == "Vogel":
         return vogel_ipr(Pr=Pr, Pb=Pb, q_test=qt, Pwf_test=pwft)
     else:
@@ -951,7 +951,7 @@ class FluidSection(QWidget):
         self.sg_o = _dspin(0.82,  0.60, 1.10, 0.005, 3)
         self.sg_g = _dspin(0.915, 0.55, 1.50, 0.005, 3)
         self.sg_w = _dspin(1.07,  0.98, 1.20, 0.005, 3)
-        self.wc  = _dspin(0.0,   0.0,  50.0, 0.1,   2)
+        self.wc  = _dspin(0.0,   0.0,  1.0, 0.1,   2)
 
         lay.addWidget(_row("SG Oil",   self.sg_o, "(w=1)"))
         lay.addWidget(_row("SG Gas",   self.sg_g, "(air=1)"))
