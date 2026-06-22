@@ -255,7 +255,7 @@ def _build_pvt_vlp(p: dict) -> tuple[BlackOilPVT, HagedornBrown]:
 
 def _vlp_pwf(vlp: HagedornBrown, p: dict, q: float) -> float:
     """Run a pressure traverse and return the bottomhole pressure (psia)."""
-    _, pressures = vlp.calculate_pressure_traverse(
+    _, pressures, _ = vlp.calculate_pressure_traverse(
         Pth=p["thp"],
         surface_temp=p["T_surface"],
         bottomhole_temp=p["T_bh"],
@@ -335,6 +335,7 @@ class AnalysisWorker(QRunnable):
             }
             traverse_depths: list = []
             traverse_pressures: list = []
+            traverse_profiles: dict = {}
             fp_op: dict = {}
 
             q_lo, q_hi = float(p["q_min"]), float(p["q_max"])
@@ -381,7 +382,7 @@ class AnalysisWorker(QRunnable):
                         # Pressure traverse at operating rate (for mini-map)
                         self.signals.status.emit(
                             f"⏳  Computing pressure traverse at q* = {q_star:.1f} STB/d…")
-                        traverse_depths, traverse_pressures = vlp.calculate_pressure_traverse(
+                        traverse_depths, traverse_pressures, traverse_profiles = vlp.calculate_pressure_traverse(
                             Pth=p["thp"], surface_temp=p["T_surface"],
                             bottomhole_temp=p["T_bh"], total_depth=p["depth"],
                             step_size=p["dz_step"], Ql=q_star,
@@ -400,9 +401,9 @@ class AnalysisWorker(QRunnable):
                         
                         print("\n" + "="*50)
                         print(f"OPERATING POINT TRAVERSE DATA (q={q_star:.1f} STB/d):")
-                        print(f"{'Depth (ft)':>15} | {'Pressure (psia)':>15}")
-                        for d, p_trav in zip(traverse_depths, traverse_pressures):
-                            print(f"{d:>15.1f} | {p_trav:>15.1f}")
+                        print(f"{'Depth (ft)':>12} | {'P (psia)':>10} | {'Holdup':>8} | {'f':>8} | {'dp/dz_el':>10} | {'dp/dz_fric':>10} | {'dp/dz':>10}")
+                        for i in range(len(traverse_depths)):
+                            print(f"{traverse_depths[i]:>12.1f} | {traverse_pressures[i]:>10.1f} | {traverse_profiles['holdup'][i]:>8.4f} | {traverse_profiles['friction_factor'][i]:>8.4f} | {traverse_profiles['hydrostatic_loss'][i]:>10.4f} | {traverse_profiles['frictional_loss'][i]:>10.4f} | {traverse_profiles['total_gradient'][i]:>10.4f}")
                         print("="*50 + "\n")
             except Exception as solve_err:
                 sol["message"] = str(solve_err)
@@ -415,6 +416,7 @@ class AnalysisWorker(QRunnable):
                 "sol":                sol,
                 "traverse_depths":    list(traverse_depths),
                 "traverse_pressures": list(traverse_pressures),
+                "traverse_profiles":  traverse_profiles,
                 "fp_op":              fp_op,
             })
 
@@ -1437,9 +1439,24 @@ class MainWindow(QMainWindow):
                 
                 if data.get("traverse_depths"):
                     writer.writerow(["--- TRAVERSE DATA AT OPERATING POINT ---"])
-                    writer.writerow(["Depth (ft)", "Pressure (psia)"])
-                    for d, p in zip(data["traverse_depths"], data["traverse_pressures"]):
-                        writer.writerow([d, p])
+                    
+                    if data.get("traverse_profiles"):
+                        writer.writerow(["Depth (ft)", "Pressure (psia)", "Holdup", "Friction Factor", "Hydrostatic Loss (psi/ft)", "Frictional Loss (psi/ft)", "Total Gradient (psi/ft)"])
+                        profs = data["traverse_profiles"]
+                        for i in range(len(data["traverse_depths"])):
+                            writer.writerow([
+                                data["traverse_depths"][i],
+                                data["traverse_pressures"][i],
+                                profs["holdup"][i],
+                                profs["friction_factor"][i],
+                                profs["hydrostatic_loss"][i],
+                                profs["frictional_loss"][i],
+                                profs["total_gradient"][i]
+                            ])
+                    else:
+                        writer.writerow(["Depth (ft)", "Pressure (psia)"])
+                        for d, p in zip(data["traverse_depths"], data["traverse_pressures"]):
+                            writer.writerow([d, p])
                         
             self._status(f"✅  Data successfully exported to {file_path}", C_INK)
         except Exception as e:

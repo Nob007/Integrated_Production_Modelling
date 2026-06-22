@@ -28,9 +28,9 @@ def find_operating_point(ipr_model, vlp_model, vlp_params, q_min=100.0, q_max=No
         p_wf_ipr = ipr_model.calculate_Pwf(q)
         
         # Calculate Pwf from the Wellbore side (VLP)
-        # Note: calculate_pressure_traverse returns a tuple (depths, pressures). 
+        # Note: calculate_pressure_traverse returns a tuple (depths, pressures, profiles). 
         # The bottom-hole pressure is the last element [-1] in the pressures list.
-        _, pressures = vlp_model.calculate_pressure_traverse(
+        _, pressures, _ = vlp_model.calculate_pressure_traverse(
             Pth=vlp_params['Pth'],
             surface_temp=vlp_params['surface_temp'],
             bottomhole_temp=vlp_params['bottomhole_temp'],

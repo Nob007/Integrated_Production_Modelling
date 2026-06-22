@@ -134,7 +134,7 @@ def _build_vlp_evaluator(vlp_model, vlp_params: dict):
     sees a simple f(q) interface.
     """
     def _vlp(q: float) -> float:
-        _, pressures = vlp_model.calculate_pressure_traverse(
+        _, pressures, _ = vlp_model.calculate_pressure_traverse(
             Pth             = vlp_params["Pth"],
             surface_temp    = vlp_params["surface_temp"],
             bottomhole_temp = vlp_params["bottomhole_temp"],

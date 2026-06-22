@@ -175,24 +175,18 @@ class HagedornBrown:
              * (self.fp["Pr"] / 14.7) ** 0.1
              * (CNl / Nd))
 
-        # ------------------------------------------------------------------
-        # THE FIX: Digitized Hagedorn-Brown Chart Lookup
-        # ------------------------------------------------------------------
-        
-        # X-axis data points (H parameter)
-        chart_H = np.array([
-            0.001, 0.002, 0.004, 0.01, 0.02, 0.04, 0.1, 0.2, 0.4, 1.0, 2.0, 4.0, 10.0
-        ])
-        
-        # Y-axis data points (Hl/psi parameter) read directly from the original publication
-        chart_Hl_psi = np.array([
-            0.015, 0.028, 0.048, 0.095, 0.160, 0.260, 0.440, 0.600, 0.770, 0.920, 0.980, 0.995, 1.000
-        ])
+        # Digitized Chart for Hl/Psi to prevent polynomial crashing at mist flow
+        # chart_H = np.array([1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 0.1, 0.5,  1.0, 10.0])
+        # chart_Hl_psi = np.array([0.004, 0.008, 0.012, 0.025, 0.035, 0.07, 0.11, 0.30, 0.45, 0.82, 0.94, 1.0])
+        # Hl_psi = np.interp(H, chart_H, chart_Hl_psi)
 
-        # numpy.interp naturally flatlines if H drops below 0.001 or exceeds 10.0
-        Hl_psi = np.interp(H, chart_H, chart_Hl_psi)
-
-        B = Ngv * (Nlv ** 0.38) / (Nd ** 2.14)
+        # B = Ngv * (Nlv ** 0.38) / (Nd ** 2.14)
+        H_safe = max(H, 1e-6)
+        Hl_psi = np.sqrt(
+            (0.0047 + 1123.32 * H_safe + 729489.64 * H_safe ** 2)
+            / (1.0 + 1097.1566 * H_safe + 722153.97 * H_safe ** 2)
+            )
+        B = Ngv * (Nlv ** 0.38) / (Nd ** 2.14)   # Nlv, not Nl
         if B <= 0.025:
             psi = 27170 * B**3 - 317.52 * B**2 + 0.5472 * B + 0.9999
         elif B <= 0.055:
@@ -241,8 +235,8 @@ class HagedornBrown:
         self.fp["rho_m"] = self.fp["rho_l"] * Hl + self.fp["rho_g"] * (1.0 - Hl)
         self.fp["mu_m"]  = (self.fp["mu_l"] ** Hl) * (self.fp["mu_g"] ** (1.0 - Hl))
 
-        # return 0.7 * Hl + 0.3 * self.griffith_holdup()
-        return Hl
+        return 1.0 * Hl + 0.0 * self.griffith_holdup()
+        # return Hl
 
     # ------------------------------------------------------------------
     # Friction factor  (Jain / Colebrook approximation)
@@ -296,6 +290,13 @@ class HagedornBrown:
     # This covers virtually every wellbore multiphase flow condition,
     # so there is no practical need to iterate Colebrook-White here.
         f = (1.14 - 2.0 * np.log10(relative_roughness + 21.25 / (Re ** 0.9))) ** -2
+        x = lambda_l/ Hl ** 2
+        if ((x > 1) and (x < 1.2)):
+            s = np.log(2.2 * x - 1.2)
+        else:
+            s = np.log(x) / (-0.0523 + 3.182 * np.log(x) - 0.8725 * (np.log(x)) ** 2 + 0.01853 * (np.log(x)) ** 4)
+    
+        f = f * np.exp(s) 
 
         return f
 
@@ -303,7 +304,7 @@ class HagedornBrown:
     # Pressure gradient
     # ------------------------------------------------------------------
 
-    def calculate_gradient(self):
+    def calculate_gradient(self, P,  return_components=False):
         """
         Calculates the total multiphase pressure gradient (psi/ft).
 
@@ -318,10 +319,13 @@ class HagedornBrown:
 
         dp_dh_el   = self.fp["rho_m"] * np.cos(self.theta) / 144.0
         gc         = 32.174
-        # dp_dh_fric = (f * self.fp["rho_ns"] * self.fp["Vm"] ** 2) / (2.0 * gc * self.tid * 144.0)
-        dp_dh_fric = (f * self.Ql**2 * self.fp["M"]**2 )/(2.9652 * 10**11 * self.tid**5 * self.fp["rho_m"] * 144)
+        dp_dh_fric = (2 * f * self.fp["rho_ns"] * self.fp["Vm"] ** 2) / ( gc * self.tid * 144.0)
+        Ek = self.fp["Vm"] * self.fp["Vsg"] * self.fp["rho_m"] / (32.17 * P * 144 )
 
-        return dp_dh_el + dp_dh_fric
+        dp_dz = dp_dh_el + dp_dh_fric/(1-Ek)
+        if return_components:
+            return dp_dz, Hl, f, dp_dh_el, dp_dh_fric
+        return dp_dz
 
     # ------------------------------------------------------------------
     # Pressure traverse
@@ -333,10 +337,17 @@ class HagedornBrown:
         Calculates the wellbore pressure profile via Euler integration.
 
         Returns:
-            tuple: (depths [ft], pressures [psia])
+            tuple: (depths [ft], pressures [psia], profiles [dict])
         """
         depths        = [0.0]
         pressures     = [Pth]
+        
+        holdups = []
+        frictions = []
+        hydro_losses = []
+        fric_losses = []
+        total_gradients = []
+        
         current_P     = Pth
         current_depth = 0.0
         temp_gradient = (bottomhole_temp - surface_temp) / total_depth
@@ -347,14 +358,39 @@ class HagedornBrown:
             current_temp = surface_temp + temp_gradient * current_depth
 
             self.update_fluid_properties(current_P, current_temp, Ql)
-            dp_dz     = self.calculate_gradient()
+            dp_dz, Hl, f, dp_dh_el, dp_dh_fric = self.calculate_gradient(current_P,return_components=True)
+            if next_depth == total_depth:
+                print(f"Holdup: {Hl} at depth {current_depth} at flow rate {Ql}")
             current_P += dp_dz * actual_step
             current_depth = next_depth
 
             depths.append(current_depth)
             pressures.append(current_P)
+            
+            holdups.append(Hl)
+            frictions.append(f)
+            hydro_losses.append(dp_dh_el)
+            fric_losses.append(dp_dh_fric)
+            total_gradients.append(dp_dz)
 
-        return depths, pressures
+        if holdups:
+            holdups.insert(0, holdups[0])
+            frictions.insert(0, frictions[0])
+            hydro_losses.insert(0, hydro_losses[0])
+            fric_losses.insert(0, fric_losses[0])
+            total_gradients.insert(0, total_gradients[0])
+        else:
+            holdups = [0.0]; frictions = [0.0]; hydro_losses = [0.0]; fric_losses = [0.0]; total_gradients = [0.0]
+            
+        profiles = {
+            "holdup": holdups,
+            "friction_factor": frictions,
+            "hydrostatic_loss": hydro_losses,
+            "frictional_loss": fric_losses,
+            "total_gradient": total_gradients
+        }
+
+        return depths, pressures, profiles
 
     # ------------------------------------------------------------------
     # Plotting helpers
@@ -362,7 +398,7 @@ class HagedornBrown:
 
     def plot_pressure_traverse(self, Pth, surface_temp, bottomhole_temp,
                                total_depth, step_size, Ql):
-        depths, pressures = self.calculate_pressure_traverse(
+        depths, pressures, _ = self.calculate_pressure_traverse(
             Pth, surface_temp, bottomhole_temp, total_depth, step_size, Ql
         )
         plt.plot(pressures, depths, color='blue', linewidth=2)
@@ -380,7 +416,7 @@ class HagedornBrown:
         rates = np.linspace(Qmin, Qmax, Qmax - Qmin)
 
         for q in rates:
-            _, pressures = self.calculate_pressure_traverse(
+            _, pressures, _ = self.calculate_pressure_traverse(
                 Pth, surface_temp, bottomhole_temp, depth, step_size, q
             )
             Pwf_points.append(pressures[-1])
@@ -517,30 +553,81 @@ class Beggs_Brill:
         theta_h = np.radians(90.0 - self.theta_ui)
         sin_term = np.sin(1.8 * theta_h)
 
-        def get_C_and_Hl0(pattern):
+        # def get_C_and_Hl0(pattern):
+        #     if pattern == "segregated":
+        #         hl0 = 0.98 * (Cl**0.4846 / Nfr**0.0868)
+        #         c = (1 - Cl) * np.log(0.011 * Nlv**3.539 * Cl**(-3.768) * Nfr**(-1.614))
+        #     elif pattern == "intermittent":
+        #         hl0 = 0.845 * (Cl**0.5351 / Nfr**0.0173)
+        #         c = (1 - Cl) * np.log(2.96 * Nlv**(-0.4473) * Cl**0.305 * Nfr**(0.0978))
+        #     else:
+        #         hl0 = 1.065 * (Cl**0.5824 / Nfr**0.0609)
+        #         c = 0.0
+        #     return max(hl0, Cl), max(c, 0.0)
+
+        # if flow_pattern == "transitional":
+        #     hl0_seg, c_seg = get_C_and_Hl0("segregated")
+        #     hl_seg = hl0_seg * (1.0 + c_seg * (sin_term - 0.333 * sin_term**3))
+
+        #     hl0_int, c_int = get_C_and_Hl0("intermittent")
+        #     hl_int = hl0_int * (1.0 + c_int * (sin_term - 0.333 * sin_term**3))
+
+        #     A = (L3 - Nfr) / (L3 - L2)
+        #     Hl = A * hl_seg + (1.0 - A) * hl_int
+        # else:
+        #     hl0, c = get_C_and_Hl0(flow_pattern)
+        #     Hl = hl0 * (1.0 + c * (sin_term - 0.333 * sin_term**3))
+
+        # return max(Cl, min(Hl, 1.0))
+        def get_Hl(pattern):
+            """Calculates the specific holdup for a given theoretical flow pattern."""
             if pattern == "segregated":
-                hl0 = 0.98 * (Cl**0.4846 / Nfr**0.0868)
-                c = (1 - Cl) * np.log(0.011 * Nlv**3.539 * Cl**(-3.768) * Nfr**(-1.614))
+                hl0 = 0.98 * (Cl**0.4846 / max(Nfr, 1e-6)**0.0868)
+                c = (1 - Cl) * np.log(0.011 * Nlv**3.539 * Cl**(-3.768) * max(Nfr, 1e-6)**(-1.614))
             elif pattern == "intermittent":
-                hl0 = 0.845 * (Cl**0.5351 / Nfr**0.0173)
-                c = (1 - Cl) * np.log(2.96 * Nlv**(-0.4473) * Cl**0.305 * Nfr**(0.0978))
-            else:
-                hl0 = 1.065 * (Cl**0.5824 / Nfr**0.0609)
+                hl0 = 0.845 * (Cl**0.5351 / max(Nfr, 1e-6)**0.0173)
+                c = (1 - Cl) * np.log(2.96 * Nlv**(-0.4473) * Cl**0.305 * max(Nfr, 1e-6)**(0.0978))
+            else: # distributed
+                hl0 = 1.065 * (Cl**0.5824 / max(Nfr, 1e-6)**0.0609)
                 c = 0.0
-            return max(hl0, Cl), max(c, 0.0)
+            
+            hl0 = max(hl0, Cl)
+            c = max(c, 0.0)
+            psi = 1.0 + c * (sin_term - 0.333 * sin_term**3)
+            return hl0 * psi
 
+        boundary = L1 if Cl < 0.4 else L4
+        boundary_L3 = L3
+
+        # Calculate actual holdup with continuous mathematical smoothing
         if flow_pattern == "transitional":
-            hl0_seg, c_seg = get_C_and_Hl0("segregated")
-            hl_seg = hl0_seg * (1.0 + c_seg * (sin_term - 0.333 * sin_term**3))
-
-            hl0_int, c_int = get_C_and_Hl0("intermittent")
-            hl_int = hl0_int * (1.0 + c_int * (sin_term - 0.333 * sin_term**3))
-
+            hl_seg = get_Hl("segregated")
+            hl_int = get_Hl("intermittent")
             A = (L3 - Nfr) / (L3 - L2)
             Hl = A * hl_seg + (1.0 - A) * hl_int
+        elif 0.8 * boundary_L3 < Nfr < 1.2 * boundary_L3 and Nfr > L3:
+            # Smooth the transitional -> intermittent boundary the same way
+            # the intermittent -> distributed boundary is already smoothed.
+            hl_trans_blend = get_Hl("segregated") * 0 + get_Hl("intermittent")  # transitional limit as Nfr->L3
+            hl_int = get_Hl("intermittent")
+            weight = (1.2 * boundary_L3 - Nfr) / (0.4 * boundary_L3)
+            weight = max(0.0, min(weight, 1.0))
+            Hl = weight * hl_trans_blend + (1.0 - weight) * hl_int
+        elif 0.8 * boundary < Nfr < 1.2 * boundary:
+            # ------------------------------------------------------------------
+            # COMMERCIAL FIX: Smooth out the Intermittent to Distributed cliff.
+            # Blend the holdups across a +/- 20% window of the flow regime boundary
+            # to prevent the "V-shaped" kink in the VLP curve.
+            # ------------------------------------------------------------------
+            hl_int = get_Hl("intermittent")
+            hl_dist = get_Hl("distributed")
+            
+            weight = (1.2 * boundary - Nfr) / (0.4 * boundary)
+            weight = max(0.0, min(weight, 1.0))
+            
+            Hl = weight * hl_int + (1.0 - weight) * hl_dist
         else:
-            hl0, c = get_C_and_Hl0(flow_pattern)
-            Hl = hl0 * (1.0 + c * (sin_term - 0.333 * sin_term**3))
+            Hl = get_Hl(flow_pattern)
 
         return max(Cl, min(Hl, 1.0))
     
@@ -575,7 +662,7 @@ class Beggs_Brill:
             
         return f_prime, H_L
     
-    def calculate_gradient(self, P):
+    def calculate_gradient(self, P, return_components=False):
         """
         Calculates the total multiphase pressure gradient (psi/ft).
         
@@ -596,7 +683,11 @@ class Beggs_Brill:
         friction = (f_prime * Gm * self.fp["Vm"]) / (2.0 * gc * self.tid)
         kinetic_term = 1.0 - (rho_m * self.fp["Vm"] * self.fp["Vsg"]) / (gc * P * 144.0)
         
-        dp_dz = (hydrostatic + friction) / kinetic_term / 144.0
+        dp_dh_el = hydrostatic / kinetic_term / 144.0
+        dp_dh_fric = friction / kinetic_term / 144.0
+        dp_dz = dp_dh_el + dp_dh_fric
+        if return_components:
+            return dp_dz, Hl, f_prime, dp_dh_el, dp_dh_fric
         return dp_dz
     
     def calculate_pressure_traverse(self, Pth, surface_temp, bottomhole_temp,
@@ -613,10 +704,17 @@ class Beggs_Brill:
             Ql (float): Surface liquid flow rate in STB/day.
 
         Returns:
-            tuple: (depths [ft], pressures [psia])
+            tuple: (depths [ft], pressures [psia], profiles [dict])
         """
         depths = [0.0]
         pressures = [Pth]
+        
+        holdups = []
+        frictions = []
+        hydro_losses = []
+        fric_losses = []
+        total_gradients = []
+        
         current_P = Pth
         current_depth = 0.0
         temp_gradient = (bottomhole_temp - surface_temp) / total_depth
@@ -628,15 +726,38 @@ class Beggs_Brill:
 
             # Fixed: Call internal method properly
             self._update_fluid_properties(current_P, current_temp, Ql)
-            dp_dz = self.calculate_gradient(current_P)
+            dp_dz, Hl, f_prime, dp_dh_el, dp_dh_fric = self.calculate_gradient(current_P, return_components=True)
             
             current_P += dp_dz * actual_step
             current_depth = next_depth
 
             depths.append(current_depth)
             pressures.append(current_P)
+            
+            holdups.append(Hl)
+            frictions.append(f_prime)
+            hydro_losses.append(dp_dh_el)
+            fric_losses.append(dp_dh_fric)
+            total_gradients.append(dp_dz)
+            
+        if holdups:
+            holdups.insert(0, holdups[0])
+            frictions.insert(0, frictions[0])
+            hydro_losses.insert(0, hydro_losses[0])
+            fric_losses.insert(0, fric_losses[0])
+            total_gradients.insert(0, total_gradients[0])
+        else:
+            holdups = [0.0]; frictions = [0.0]; hydro_losses = [0.0]; fric_losses = [0.0]; total_gradients = [0.0]
+            
+        profiles = {
+            "holdup": holdups,
+            "friction_factor": frictions,
+            "hydrostatic_loss": hydro_losses,
+            "frictional_loss": fric_losses,
+            "total_gradient": total_gradients
+        }
 
-        return depths, pressures
+        return depths, pressures, profiles
     
     def plot_vlp_curve(self, Pth, surface_temp, bottomhole_temp,
                        depth, Qmin, Qmax, step_size):
@@ -644,7 +765,7 @@ class Beggs_Brill:
         rates = np.linspace(Qmin, Qmax, Qmax - Qmin)
 
         for q in rates:
-            _, pressures = self.calculate_pressure_traverse(
+            _, pressures, _ = self.calculate_pressure_traverse(
                 Pth, surface_temp, bottomhole_temp, depth, step_size, q
             )
             Pwf_points.append(pressures[-1])
@@ -663,7 +784,7 @@ class Beggs_Brill:
 
         for q in rates:
             self.Ql = q
-            Pwf = Pth + self.calculate_gradient() * depth
+            Pwf = Pth + self.calculate_gradient(Pth) * depth
             Pwf_points.append(Pwf)
 
         plt.plot(rates, Pwf_points, color='blue')
