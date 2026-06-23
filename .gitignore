@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyInstaller build artifacts
+# ---------------------------
+build/
+dist/
+*.spec
+
+# User session files
+# ------------------
+.ipm_session.json
+
+# IDE / Editor directories
+# ------------------------
+.vscode/
+.idea/
+
+# Virtual Environments
+venv/
+.env
