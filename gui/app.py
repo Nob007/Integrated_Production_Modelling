@@ -53,7 +53,7 @@ from core import vlp as vlp_module
 from core.vlp import HagedornBrown, Beggs_Brill
 from core.solver_other import find_operating_points, NodalResult, StabilityType
 
-from calibration.calibrate import VLPCalibrator
+from calibration.calibrate import VLPCalibrator, apply_calibration_factors
 # ─────────────────────────────────────────────────────────────────────────────
 #  DESIGN TOKENS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,6 +372,10 @@ class AppState:
     q_max_sweep: float = 5000.0
     q_step: float = 100.0
     # Panel completion flags
+    # Calibration
+    calib_holdup_factor: float = 1.0
+    calib_friction_factor: float = 1.0
+    # Completion
     ipr_saved: bool = False
     pvt_saved: bool = False
     vlp_saved: bool = False
@@ -482,6 +486,13 @@ def build_vlp(state: AppState, pvt_model: BlackOilPVT, fp_dict: dict):
                 watercut=state.wc,
                 theta=state.theta,
             )
+        
+        # Apply calibration factors if they are not default
+        if state.calib_holdup_factor != 1.0 or state.calib_friction_factor != 1.0:
+            obj = apply_calibration_factors(
+                obj, state.calib_holdup_factor, state.calib_friction_factor
+            )
+
         return obj, ""
     except Exception as e:
         return None, str(e)
@@ -1792,11 +1803,14 @@ class SensitivityPanel(QDialog):
 #  CALIBRATION PANEL
 # ─────────────────────────────────────────────────────────────────────────────
 class CalibrationPanel(QDialog):
+    factors_applied = pyqtSignal()
+
     def __init__(self, state: AppState, parent=None):
         super().__init__(parent)
         self.state = state
         self.setWindowTitle("VLP Calibration")
         self.setMinimumSize(1100, 720)
+        self._calib_factors = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -1848,11 +1862,26 @@ class CalibrationPanel(QDialog):
         self.calib_error_lbl.setWordWrap(True)
         left_l.addWidget(self.calib_error_lbl)
         left_l.addStretch()
-
+        
+        # Action buttons
+        action_l = QHBoxLayout()
         self.run_btn = QPushButton("▶  Run Calibration")
         self.run_btn.setObjectName("primary")
         self.run_btn.clicked.connect(self._run)
-        left_l.addWidget(self.run_btn)
+        
+        self.apply_btn = QPushButton("💾 Apply Factors")
+        self.apply_btn.setObjectName("secondary")
+        self.apply_btn.clicked.connect(self._apply_factors)
+        self.apply_btn.setEnabled(False)
+        
+        self.clear_btn = QPushButton("✕ Clear Calibration")
+        self.clear_btn.setObjectName("secondary")
+        self.clear_btn.clicked.connect(self._clear_factors)
+
+        action_l.addWidget(self.run_btn, 1)
+        action_l.addWidget(self.apply_btn)
+        left_l.addLayout(action_l)
+        left_l.addWidget(self.clear_btn)
 
         self.progress = QProgressBar(); self.progress.setVisible(False)
         left_l.addWidget(self.progress)
@@ -1868,6 +1897,10 @@ class CalibrationPanel(QDialog):
         self.chart = MatplotlibWidget(figsize=(6, 5))
         right_l.addWidget(self.chart, 1)
         main.addLayout(right_l, 1)
+
+        # Set initial state for clear button
+        is_calibrated = self.state.calib_holdup_factor != 1.0 or self.state.calib_friction_factor != 1.0
+        self.clear_btn.setVisible(is_calibrated)
 
     def _run(self):
         # Collect data from table
@@ -1906,10 +1939,13 @@ class CalibrationPanel(QDialog):
         result = data["result"]
 
         if result.success:
+            self.apply_btn.setEnabled(True)
             h_factor, f_factor = result.x
+            self._calib_factors = (h_factor, f_factor)
             self.holdup_factor_lbl.setText(f"{h_factor:.4f}")
             self.friction_factor_lbl.setText(f"{f_factor:.4f}")
         else:
+            self.apply_btn.setEnabled(False)
             self.calib_error_lbl.setText(f"Calibration failed: {result.message}")
 
         self._plot(data)
@@ -1936,6 +1972,30 @@ class CalibrationPanel(QDialog):
         ax.set_title("Pressure Traverse Calibration", fontsize=12, fontweight="bold", color=NAVY)
         ax.legend()
         self.chart.refresh()
+
+    def _apply_factors(self):
+        if not self._calib_factors:
+            QMessageBox.warning(self, "No Factors", "Run a successful calibration first.")
+            return
+        
+        h_factor, f_factor = self._calib_factors
+        self.state.calib_holdup_factor = h_factor
+        self.state.calib_friction_factor = f_factor
+        self.state.save()
+        self.factors_applied.emit()
+        QMessageBox.information(self, "Factors Applied", 
+            f"Holdup ({h_factor:.4f}) and Friction ({f_factor:.4f}) factors have been saved.\n"
+            "All subsequent VLP and Nodal runs will use this calibration.")
+        self.clear_btn.setVisible(True)
+        self.accept()
+
+    def _clear_factors(self):
+        self.state.calib_holdup_factor = 1.0
+        self.state.calib_friction_factor = 1.0
+        self.state.save()
+        self.factors_applied.emit()
+        QMessageBox.information(self, "Calibration Cleared", "VLP calibration factors have been reset to 1.0.")
+        self.clear_btn.setVisible(False)
 # ─────────────────────────────────────────────────────────────────────────────
 #  COMING SOON DIALOG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2821,6 +2881,7 @@ class MainWindow(QMainWindow):
             )
             return
         dlg = CalibrationPanel(self.state, self)
+        dlg.factors_applied.connect(self.home_screen.refresh_badges)
         dlg.exec()
 
     def _open_gaslift(self):

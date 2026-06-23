@@ -4,6 +4,39 @@ from scipy.optimize import minimize
 import copy
 
 
+def apply_calibration_factors(model, holdup_factor: float, friction_factor: float):
+    """
+    Creates a deep copy of a VLP model and wraps its gradient calculation
+    methods to apply calibration factors. This is a standalone utility function.
+
+    Args:
+        model: An instantiated VLP model object (e.g., HagedornBrown).
+        holdup_factor (float): The multiplier for the liquid holdup.
+        friction_factor (float): The multiplier for the friction factor.
+
+    Returns:
+        A new, calibrated VLP model instance.
+    """
+    calibrated_model = copy.deepcopy(model)
+
+    # Store original methods
+    original_get_holdup = calibrated_model.get_holdup
+    original_frictional_factor = calibrated_model.frictional_factor
+
+    # Create new wrapped methods that apply the factors
+    def calibrated_get_holdup(*args, **kwargs):
+        return min(original_get_holdup(*args, **kwargs) * holdup_factor, 1.0)
+
+    def calibrated_frictional_factor(*args, **kwargs):
+        return original_frictional_factor(*args, **kwargs) * friction_factor
+
+    # Monkey-patch the instance with the new calibrated methods
+    calibrated_model.get_holdup = calibrated_get_holdup
+    calibrated_model.frictional_factor = calibrated_frictional_factor
+
+    return calibrated_model
+
+
 class VLPCalibrator:
     """
     Calibrates a VLP model (Hagedorn-Brown or Beggs-Brill) against measured
@@ -40,7 +73,7 @@ class VLPCalibrator:
         holdup_factor, friction_factor = factors
 
         # Create a temporary, modified VLP model for this iteration
-        temp_model = self._create_modified_model(holdup_factor, friction_factor)
+        temp_model = apply_calibration_factors(self.base_model, holdup_factor, friction_factor)
 
         # Calculate the pressure traverse with the modified model
         try:
@@ -58,34 +91,6 @@ class VLPCalibrator:
         # Calculate the sum of squared errors
         error = np.sum((interp_pressures - measured_pressures) ** 2)
         return error
-
-    def _create_modified_model(self, holdup_factor: float, friction_factor: float):
-        """
-        Creates a deep copy of the base VLP model and wraps its gradient
-        calculation methods to apply the calibration factors.
-        """
-        model = copy.deepcopy(self.base_model)
-
-        # Store original methods
-        original_get_holdup = model.get_holdup
-        original_frictional_factor = model.frictional_factor
-
-        # Create new wrapped methods
-        def calibrated_get_holdup(*args, **kwargs):
-            # Calculate original holdup and apply the factor
-            hl = original_get_holdup(*args, **kwargs)
-            return min(hl * holdup_factor, 1.0)
-
-        def calibrated_frictional_factor(*args, **kwargs):
-            # Calculate original friction factor and apply the factor
-            f = original_frictional_factor(*args, **kwargs)
-            return f * friction_factor
-
-        # Monkey-patch the instance with the new calibrated methods
-        model.get_holdup = calibrated_get_holdup
-        model.frictional_factor = calibrated_frictional_factor
-
-        return model
 
     def run(self, measured_depths, measured_pressures, initial_guess=[1.0, 1.0]):
         """
@@ -117,7 +122,7 @@ class VLPCalibrator:
         if self.result.success:
             # If successful, create the final calibrated model
             best_factors = self.result.x
-            self.calibrated_model = self._create_modified_model(best_factors[0], best_factors[1])
+            self.calibrated_model = apply_calibration_factors(self.base_model, best_factors[0], best_factors[1])
             print(f"Calibration successful! Optimal Factors: Holdup={best_factors[0]:.4f}, Friction={best_factors[1]:.4f}")
 
         return self.result
