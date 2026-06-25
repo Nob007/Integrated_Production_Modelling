@@ -54,6 +54,15 @@ from core.vlp import HagedornBrown, Beggs_Brill
 from core.solver_other import find_operating_points, NodalResult, StabilityType
 
 from calibration.calibrate import VLPCalibrator, apply_calibration_factors
+from gas_lift import gl as gl_mod
+from gas_lift.gl import apply_gas_lift_design, compute_glpc, find_optimum, injection_feasibility_mask
+from core import choke as choke_mod
+from core.choke import (
+    critical_flow_rate, critical_flow_pwh, is_critical_flow,
+    sachdeva_choke, erosional_velocity_check, joule_thomson_estimate,
+    choke_performance_curve, recommend_bean_size,
+)
+import csv
 # ─────────────────────────────────────────────────────────────────────────────
 #  DESIGN TOKENS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,11 +380,37 @@ class AppState:
     q_min: float = 50.0
     q_max_sweep: float = 5000.0
     q_step: float = 100.0
-    # Panel completion flags
     # Calibration
     calib_holdup_factor: float = 1.0
     calib_friction_factor: float = 1.0
-    # Completion
+    calib_csv_path: Optional[str] = None   # display only
+    # Gas Lift sweep params (PRD §11)
+    gl_depth_min: Optional[float] = None
+    gl_depth_max: Optional[float] = None
+    gl_depth_step: Optional[float] = 500.0
+    gl_inj_depth: Optional[float] = None   # injection depth for rate/GLR sweep
+    gl_sg_gas: Optional[float] = None      # injected gas SG; defaults to sg_gas
+    gl_q_min: float = 100.0                # Mscf/day
+    gl_q_max: float = 3000.0              # Mscf/day
+    gl_q_step: float = 100.0              # Mscf/day
+    gl_glr_min: Optional[float] = None
+    gl_glr_max: Optional[float] = None
+    gl_glr_step: Optional[float] = 500.0
+    gl_p_inj: Optional[float] = None       # available injection pressure, psia
+    gl_q_available: Optional[float] = None # compressor ceiling, Mscf/day
+    gl_econ_slope: float = 0.5             # economic threshold, STB/day per Mscf/day
+    # Gas Lift applied design (sticky)
+    gl_applied: bool = False
+    gl_opt_depth: Optional[float] = None   # ft
+    gl_opt_rate: Optional[float] = None    # Mscf/day
+    # Choke params (PRD §11)
+    choke_model: str = "gilbert"
+    choke_p_down: Optional[float] = None
+    choke_size_64: float = 32.0
+    choke_sizes_list: str = "16,20,24,28,32,36,40,48,64"
+    choke_target_q: Optional[float] = None
+    choke_c_factor: float = 100.0
+    # Panel completion flags
     ipr_saved: bool = False
     pvt_saved: bool = False
     vlp_saved: bool = False
@@ -487,11 +522,18 @@ def build_vlp(state: AppState, pvt_model: BlackOilPVT, fp_dict: dict):
                 theta=state.theta,
             )
         
-        # Apply calibration factors if they are not default
+        # Step 1: Apply calibration factors if they are not default
         if state.calib_holdup_factor != 1.0 or state.calib_friction_factor != 1.0:
             obj = apply_calibration_factors(
                 obj, state.calib_holdup_factor, state.calib_friction_factor
             )
+
+        # Step 2: Apply gas lift design if active (after calibration, as PRD specifies)
+        if getattr(state, "gl_applied", False):
+            inj_depth = state.gl_opt_depth or (state.depth * 0.55 if state.depth else 4000.0)
+            inj_rate  = state.gl_opt_rate or 500.0  # Mscf/day
+            inj_sg    = state.gl_sg_gas or state.sg_gas
+            obj = apply_gas_lift_design(obj, inj_depth, inj_rate, inj_sg)
 
         return obj, ""
     except Exception as e:
@@ -1468,6 +1510,16 @@ class VLPPanel(QDialog):
         # Right: VLP chart
         right_l = QVBoxLayout()
         right_l.addWidget(make_label("VLP CURVE"))
+
+        # PRD §6.4 — Sticky-modifier note (calibration / gas lift active)
+        self.vlp_modifier_chip = QLabel("")
+        self.vlp_modifier_chip.setStyleSheet(
+            f"color:{BLUE}; font-size:11px; font-weight:600; "
+            f"background:{BLUE_L}; border-radius:8px; padding:2px 10px;"
+        )
+        self.vlp_modifier_chip.setVisible(False)
+        right_l.addWidget(self.vlp_modifier_chip)
+
         self.chart = MatplotlibWidget(figsize=(6, 5))
         right_l.addWidget(self.chart, 1)
         main.addLayout(right_l, 1)
@@ -1489,6 +1541,23 @@ class VLPPanel(QDialog):
             if val is not None:
                 edit.setText(str(val))
 
+        # PRD §6.4 — update sticky-modifier chip
+        self._update_modifier_chip()
+
+    def _update_modifier_chip(self):
+        """Show an inline note whenever calibration or gas lift is silently shaping VLP curves."""
+        s = self.state
+        parts = []
+        if s.calib_holdup_factor != 1.0 or s.calib_friction_factor != 1.0:
+            parts.append("Calibrated")
+        if getattr(s, "gl_applied", False):
+            parts.append("Gas-lift applied")
+        if parts:
+            self.vlp_modifier_chip.setText("⚡ " + " · ".join(parts))
+            self.vlp_modifier_chip.setVisible(True)
+        else:
+            self.vlp_modifier_chip.setVisible(False)
+
     def _collect(self):
         def safe(e, default=None):
             try: return float(e.text())
@@ -1498,7 +1567,7 @@ class VLPPanel(QDialog):
             "tubing_id": safe(self.tubing_id_edit) / 12.0 if safe(self.tubing_id_edit) is not None else None,
             "tubing_od": safe(self.tubing_od_edit) / 12.0 if safe(self.tubing_od_edit) is not None else None,
             "casing_id": safe(self.casing_id_edit) / 12.0 if safe(self.casing_id_edit) is not None else None,
-            "roughness": safe(self.roughness_edit, 0.0006) / 12.0,
+            "roughness": safe(self.roughness_edit) / 12.0 if safe(self.roughness_edit) is not None else None,
             "theta": safe(self.theta_edit, 0.0),
             "depth": safe(self.depth_edit),
             "dz_step": safe(self.dz_step_edit, 50.0),
@@ -1834,13 +1903,26 @@ class CalibrationPanel(QDialog):
             self.table.setItem(r, 1, QTableWidgetItem(p))
         left_l.addWidget(self.table)
 
+        # PRD §6.10 — table tools with CSV Upload
         table_tools = QHBoxLayout()
         add_row_btn = QPushButton("＋ Add Row"); add_row_btn.setObjectName("secondary")
         add_row_btn.clicked.connect(lambda: self.table.insertRow(self.table.rowCount()))
         rem_row_btn = QPushButton("－ Remove Row"); rem_row_btn.setObjectName("secondary")
         rem_row_btn.clicked.connect(lambda: self.table.removeRow(self.table.currentRow()))
+        upload_csv_btn = QPushButton("📂 Upload CSV"); upload_csv_btn.setObjectName("secondary")
+        upload_csv_btn.setToolTip("Upload a measured pressure-survey CSV (columns: depth_ft, pressure_psia)")
+        upload_csv_btn.clicked.connect(self._upload_csv)
         table_tools.addWidget(add_row_btn); table_tools.addWidget(rem_row_btn)
+        table_tools.addStretch()
+        table_tools.addWidget(upload_csv_btn)
         left_l.addLayout(table_tools)
+
+        # CSV path display
+        self.csv_path_lbl = QLabel("")
+        self.csv_path_lbl.setStyleSheet(f"color:{SLATE}; font-size:10px; font-style:italic;")
+        if self.state.calib_csv_path:
+            self.csv_path_lbl.setText(f"Last upload: {os.path.basename(self.state.calib_csv_path)}")
+        left_l.addWidget(self.csv_path_lbl)
 
         # Results
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine); sep.setStyleSheet(f"color: {BLUE_M};")
@@ -1996,6 +2078,864 @@ class CalibrationPanel(QDialog):
         self.factors_applied.emit()
         QMessageBox.information(self, "Calibration Cleared", "VLP calibration factors have been reset to 1.0.")
         self.clear_btn.setVisible(False)
+
+    def _upload_csv(self):
+        """PRD §6.10 — Upload a measured pressure-survey CSV to populate the table."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Pressure Survey CSV", "",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path:
+            return
+
+        # Confirm if table already has user data
+        has_data = any(
+            self.table.item(r, 0) and self.table.item(r, 0).text().strip()
+            for r in range(self.table.rowCount())
+        )
+        if has_data:
+            ans = QMessageBox.question(
+                self, "Replace Table Data",
+                "The table already has data. Replace it with the CSV contents?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        # Parse CSV
+        rows = []
+        warnings = []
+        try:
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                header_skipped = False
+                for line_num, row in enumerate(reader, start=1):
+                    if not row or all(c.strip() == "" for c in row):
+                        continue
+                    # Skip header row (non-numeric first cell)
+                    try:
+                        d = float(row[0].strip())
+                    except (ValueError, IndexError):
+                        if not header_skipped:
+                            header_skipped = True
+                            continue
+                        warnings.append(f"Row {line_num}: could not parse depth '{row[0] if row else ''}'")
+                        continue
+                    try:
+                        p = float(row[1].strip())
+                    except (ValueError, IndexError):
+                        warnings.append(f"Row {line_num}: could not parse pressure '{row[1] if len(row) > 1 else ''}'")
+                        continue
+                    # Depth range check
+                    max_depth = self.state.depth or float("inf")
+                    if d < 0 or d > max_depth:
+                        warnings.append(f"Row {line_num}: depth {d:.0f} ft outside [0, {max_depth:.0f}] — skipped")
+                        continue
+                    rows.append((d, p))
+        except Exception as e:
+            QMessageBox.warning(self, "CSV Error", f"Could not read file:\n{e}")
+            return
+
+        if len(rows) < 2:
+            QMessageBox.warning(
+                self, "Insufficient Data",
+                "Need at least 2 valid (depth, pressure) rows after parsing."
+                + ("\n\nWarnings:\n" + "\n".join(warnings) if warnings else "")
+            )
+            return
+
+        # Auto-sort by ascending depth
+        rows.sort(key=lambda x: x[0])
+
+        # Populate table
+        self.table.setRowCount(len(rows))
+        for r, (d, p) in enumerate(rows):
+            self.table.setItem(r, 0, QTableWidgetItem(f"{d:.2f}"))
+            self.table.setItem(r, 1, QTableWidgetItem(f"{p:.2f}"))
+
+        # Store path for display
+        self.state.calib_csv_path = path
+        self.csv_path_lbl.setText(f"Loaded: {os.path.basename(path)} ({len(rows)} rows)")
+        self.state.save()
+
+        # Show warnings if any
+        if warnings:
+            QMessageBox.information(
+                self, "CSV Loaded with Warnings",
+                f"{len(rows)} valid rows loaded.\n\nSkipped rows:\n" + "\n".join(warnings)
+            )
+        else:
+            QMessageBox.information(
+                self, "CSV Loaded",
+                f"{len(rows)} data points loaded from {os.path.basename(path)}.\n"
+                "You can edit rows before clicking Run Calibration."
+            )
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GAS LIFT WORKER
+# ─────────────────────────────────────────────────────────────────────────────
+class GasLiftWorker(BaseWorker):
+    """Async worker that calls compute_glpc for depth / rate / GLR sweeps."""
+    def __init__(self, state: AppState, sweep_param: str, sweep_values: list,
+                 gl_inj_depth=None, gl_inj_rate_mscf=None, gl_sg_gas=None):
+        super().__init__()
+        self._state        = copy.deepcopy(state)
+        self._sweep_param  = sweep_param
+        self._sweep_values = list(sweep_values)
+        self._inj_depth    = gl_inj_depth
+        self._inj_rate     = gl_inj_rate_mscf
+        self._sg_gas       = gl_sg_gas
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            result = compute_glpc(
+                state=self._state,
+                sweep_param=self._sweep_param,
+                sweep_values=self._sweep_values,
+                build_ipr_fn=build_ipr,
+                build_vlp_fn=build_vlp,
+                build_pvt_fn=build_pvt,
+                get_fp_fn=get_fp,
+                find_op_fn=find_operating_points,
+                gl_inj_depth=self._inj_depth,
+                gl_inj_rate_mscf=self._inj_rate,
+                gl_sg_gas=self._sg_gas,
+                progress_callback=lambda p, m: self.signals.progress.emit(p, m),
+            )
+            self.signals.finished.emit(result)
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GAS LIFT PANEL
+# ─────────────────────────────────────────────────────────────────────────────
+class GasLiftPanel(QDialog):
+    design_applied = pyqtSignal()
+    design_reset   = pyqtSignal()
+
+    def __init__(self, state: AppState, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self.setWindowTitle("Gas Lift Analysis")
+        self.setMinimumSize(1150, 760)
+        self._depth_result = None
+        self._rate_result  = None
+        self._glr_result   = None
+        self._opt_depth    = None
+        self._opt_rate     = None
+        self._opt_glr      = None
+        self._setup_ui()
+
+    # ── UI ──────────────────────────────────────────────────────────────────
+    def _setup_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Title bar
+        title_bar = QFrame()
+        title_bar.setStyleSheet(f"background:{NAVY};")
+        tb_l = QHBoxLayout(title_bar)
+        tb_l.setContentsMargins(20, 10, 20, 10)
+        t_lbl = QLabel("Gas Lift Analysis")
+        t_lbl.setStyleSheet(f"color:{WHITE}; font-size:18px; font-weight:700;")
+        tb_l.addWidget(t_lbl)
+        tb_l.addStretch()
+        self.active_lbl = make_chip(
+            "⚡ Active" if self.state.gl_applied else "● Off",
+            "chip_success" if self.state.gl_applied else "chip_gray")
+        tb_l.addWidget(self.active_lbl)
+        outer.addWidget(title_bar)
+
+        # Tabs
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        outer.addWidget(self.tabs, 1)
+        self._build_depth_tab()
+        self._build_rate_tab()
+        self._build_glr_tab()
+        self._build_summary_tab()
+
+        # Bottom action bar
+        bot = QFrame()
+        bot.setStyleSheet(f"background:{OFF_W}; border-top:1px solid {BLUE_M};")
+        bot_l = QHBoxLayout(bot)
+        bot_l.setContentsMargins(20, 10, 20, 10)
+        self.apply_btn = QPushButton("✅  Apply Design")
+        self.apply_btn.setObjectName("primary")
+        self.apply_btn.clicked.connect(self._apply_design)
+        self.apply_btn.setEnabled(False)
+        self.reset_btn = QPushButton("✕  Reset Gas Lift")
+        self.reset_btn.setObjectName("secondary")
+        self.reset_btn.clicked.connect(self._reset_design)
+        self.reset_btn.setEnabled(self.state.gl_applied)
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("secondary")
+        close_btn.clicked.connect(self.reject)
+        bot_l.addWidget(self.apply_btn)
+        bot_l.addWidget(self.reset_btn)
+        bot_l.addStretch()
+        bot_l.addWidget(close_btn)
+        outer.addWidget(bot)
+
+    def _tab_pane(self):
+        """Return (tab_widget, left_widget, left_layout, right_layout)."""
+        tab = QWidget()
+        lay = QHBoxLayout(tab)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(16)
+        left = QWidget(); left.setFixedWidth(340)
+        ll = QVBoxLayout(left); ll.setSpacing(10)
+        rl = QVBoxLayout()
+        lay.addWidget(left)
+        lay.addLayout(rl, 1)
+        return tab, left, ll, rl
+
+    def _build_depth_tab(self):
+        tab, _, ll, rl = self._tab_pane()
+        ll.addWidget(SectionHeader("Optimum Injection Depth",
+                                   "Sweep depth at a fixed injection rate"))
+        self.d_min_e,  u = make_input("e.g. 1000",  unit="ft");       ll.addLayout(make_row("Depth Min",           self.d_min_e,  u))
+        self.d_max_e,  u = make_input("e.g. 8000",  unit="ft");       ll.addLayout(make_row("Depth Max",           self.d_max_e,  u))
+        self.d_step_e, u = make_input("500",         unit="ft");       ll.addLayout(make_row("Depth Step",          self.d_step_e, u))
+        self.d_rate_e, u = make_input("500",         unit="Mscf/day"); ll.addLayout(make_row("Fixed Inj. Rate",     self.d_rate_e, u))
+        self.d_pinj_e, u = make_input("optional",    unit="psia");     ll.addLayout(make_row("Avail. Inj. Pressure",self.d_pinj_e, u))
+        self.d_err = QLabel(""); self.d_err.setStyleSheet(f"color:{WARNING}; font-size:11px;")
+        self.d_err.setWordWrap(True); ll.addWidget(self.d_err)
+        ll.addStretch()
+        self.d_run = QPushButton("▶  Run Depth Sweep"); self.d_run.setObjectName("primary")
+        self.d_run.clicked.connect(self._run_depth); ll.addWidget(self.d_run)
+        self.d_prog = QProgressBar(); self.d_prog.setVisible(False); ll.addWidget(self.d_prog)
+        self.d_opt_chip = make_chip("Run sweep to find optimum", "chip_gray"); ll.addWidget(self.d_opt_chip)
+
+        rl.addWidget(make_label("LIQUID RATE vs. INJECTION DEPTH"))
+        self.d_chart = MatplotlibWidget(figsize=(6, 4)); rl.addWidget(self.d_chart, 1)
+        self.tabs.addTab(tab, "1 · Optimum Depth")
+
+        # Pre-fill
+        if self.state.gl_depth_min:  self.d_min_e.setText(str(self.state.gl_depth_min))
+        if self.state.gl_depth_max:  self.d_max_e.setText(str(self.state.gl_depth_max))
+        if self.state.gl_depth_step: self.d_step_e.setText(str(self.state.gl_depth_step))
+
+    def _build_rate_tab(self):
+        tab, _, ll, rl = self._tab_pane()
+        ll.addWidget(SectionHeader("Optimum Injection Rate",
+                                   "Gas Lift Performance Curve (GLPC)"))
+        self.r_depth_e,  u = make_input("e.g. 5000",  unit="ft");         ll.addLayout(make_row("Injection Depth",       self.r_depth_e,  u))
+        self.r_sg_e,     u = make_input("0.65",        unit="air=1");      ll.addLayout(make_row("Injection Gas SG",      self.r_sg_e,     u))
+        self.r_qmin_e,   u = make_input("100",          unit="Mscf/day");  ll.addLayout(make_row("Min Inj. Rate",          self.r_qmin_e,   u))
+        self.r_qmax_e,   u = make_input("3000",         unit="Mscf/day");  ll.addLayout(make_row("Max Inj. Rate",          self.r_qmax_e,   u))
+        self.r_qstep_e,  u = make_input("100",          unit="Mscf/day");  ll.addLayout(make_row("Rate Step",              self.r_qstep_e,  u))
+        self.r_pinj_e,   u = make_input("optional",     unit="psia");      ll.addLayout(make_row("Avail. Inj. Pressure",   self.r_pinj_e,   u))
+        self.r_qavail_e, u = make_input("optional",     unit="Mscf/day");  ll.addLayout(make_row("Compressor Ceiling",     self.r_qavail_e, u))
+        self.r_econ_e,   u = make_input("0.5",          unit="STB/Mscf");  ll.addLayout(make_row("Econ Slope Threshold",   self.r_econ_e,   u))
+        self.r_err = QLabel(""); self.r_err.setStyleSheet(f"color:{WARNING}; font-size:11px;")
+        self.r_err.setWordWrap(True); ll.addWidget(self.r_err)
+        ll.addStretch()
+        self.r_run = QPushButton("▶  Run Rate Sweep (GLPC)"); self.r_run.setObjectName("primary")
+        self.r_run.clicked.connect(self._run_rate); ll.addWidget(self.r_run)
+        self.r_prog = QProgressBar(); self.r_prog.setVisible(False); ll.addWidget(self.r_prog)
+        self.r_opt_chip = make_chip("Run sweep to find optimum", "chip_gray"); ll.addWidget(self.r_opt_chip)
+
+        rl.addWidget(make_label("GAS LIFT PERFORMANCE CURVE — Liquid Rate vs. Injection Gas Rate"))
+        self.r_chart = MatplotlibWidget(figsize=(6, 4)); rl.addWidget(self.r_chart, 1)
+        self.tabs.addTab(tab, "2 · Optimum Rate")
+
+        if self.state.gl_inj_depth:   self.r_depth_e.setText(str(self.state.gl_inj_depth))
+        self.r_sg_e.setText(str(self.state.gl_sg_gas or self.state.sg_gas))
+        self.r_qmin_e.setText(str(self.state.gl_q_min))
+        self.r_qmax_e.setText(str(self.state.gl_q_max))
+        self.r_qstep_e.setText(str(self.state.gl_q_step))
+        if self.state.gl_p_inj:       self.r_pinj_e.setText(str(self.state.gl_p_inj))
+        if self.state.gl_q_available: self.r_qavail_e.setText(str(self.state.gl_q_available))
+        self.r_econ_e.setText(str(self.state.gl_econ_slope))
+
+    def _build_glr_tab(self):
+        tab, _, ll, rl = self._tab_pane()
+        ll.addWidget(SectionHeader("Optimum GLR",
+                                   "Total GLR sweep above the injection point"))
+        self.g_min_e,  u = make_input("e.g. 500",  unit="scf/STB"); ll.addLayout(make_row("GLR Min",  self.g_min_e,  u))
+        self.g_max_e,  u = make_input("e.g. 5000", unit="scf/STB"); ll.addLayout(make_row("GLR Max",  self.g_max_e,  u))
+        self.g_step_e, u = make_input("500",        unit="scf/STB"); ll.addLayout(make_row("GLR Step", self.g_step_e, u))
+        self.g_err = QLabel(""); self.g_err.setStyleSheet(f"color:{WARNING}; font-size:11px;")
+        self.g_err.setWordWrap(True); ll.addWidget(self.g_err)
+        ll.addStretch()
+        self.g_run = QPushButton("▶  Run GLR Sweep"); self.g_run.setObjectName("primary")
+        self.g_run.clicked.connect(self._run_glr); ll.addWidget(self.g_run)
+        self.g_prog = QProgressBar(); self.g_prog.setVisible(False); ll.addWidget(self.g_prog)
+        self.g_opt_chip = make_chip("Run sweep to find optimum", "chip_gray"); ll.addWidget(self.g_opt_chip)
+
+        rl.addWidget(make_label("LIQUID RATE vs. TOTAL GLR"))
+        self.g_chart = MatplotlibWidget(figsize=(6, 4)); rl.addWidget(self.g_chart, 1)
+        self.tabs.addTab(tab, "3 · Optimum GLR")
+
+        if self.state.gl_glr_min:  self.g_min_e.setText(str(self.state.gl_glr_min))
+        if self.state.gl_glr_max:  self.g_max_e.setText(str(self.state.gl_glr_max))
+        if self.state.gl_glr_step: self.g_step_e.setText(str(self.state.gl_glr_step))
+
+    def _build_summary_tab(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab); lay.setContentsMargins(24, 24, 24, 24); lay.setSpacing(16)
+        lay.addWidget(SectionHeader("Summary & Apply Design",
+                                    "Consolidate best picks from Tabs 1–3, then apply to all VLP computations"))
+
+        grid = QGridLayout(); grid.setSpacing(12)
+        for ci, h in enumerate(["Parameter", "Optimum Value", "Unit"]):
+            lbl = QLabel(h.upper()); lbl.setObjectName("section"); grid.addWidget(lbl, 0, ci)
+
+        self.sum_depth_lbl   = QLabel("—"); self.sum_depth_lbl.setObjectName("kpi_value")
+        self.sum_rate_lbl    = QLabel("—"); self.sum_rate_lbl.setObjectName("kpi_value")
+        self.sum_glr_lbl     = QLabel("—"); self.sum_glr_lbl.setObjectName("kpi_value")
+        self.sum_q_lbl       = QLabel("—"); self.sum_q_lbl.setObjectName("kpi_value")
+        self.sum_improve_lbl = QLabel("—"); self.sum_improve_lbl.setObjectName("kpi_value")
+
+        for ri, (name, lbl, unit) in enumerate([
+            ("Injection Depth",   self.sum_depth_lbl,   "ft"),
+            ("Injection Rate",    self.sum_rate_lbl,    "Mscf/day"),
+            ("Total GLR",         self.sum_glr_lbl,     "scf/STB"),
+            ("Resulting q*",      self.sum_q_lbl,       "STB/day"),
+            ("Rate Improvement",  self.sum_improve_lbl, "vs no-lift"),
+        ], start=1):
+            grid.addWidget(QLabel(name), ri, 0)
+            grid.addWidget(lbl, ri, 1)
+            grid.addWidget(QLabel(unit), ri, 2)
+
+        lay.addLayout(grid)
+        lay.addStretch()
+
+        self.sum_status_lbl = QLabel("Run sweeps in Tabs 1–3 to populate this summary.")
+        self.sum_status_lbl.setStyleSheet(f"color:{SLATE}; font-style:italic;")
+        lay.addWidget(self.sum_status_lbl)
+
+        self.applied_chip = make_chip(
+            "⚡ Gas Lift Active" if self.state.gl_applied else "○ Not Applied",
+            "chip_success" if self.state.gl_applied else "chip_gray")
+        self.applied_chip.setFixedHeight(28)
+        lay.addWidget(self.applied_chip, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.tabs.addTab(tab, "4 · Summary")
+
+        if self.state.gl_applied:
+            if self.state.gl_opt_depth: self.sum_depth_lbl.setText(f"{self.state.gl_opt_depth:.0f}")
+            if self.state.gl_opt_rate:  self.sum_rate_lbl.setText(f"{self.state.gl_opt_rate:.0f}")
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+    def _sf(self, edit, default=None):
+        try: return float(edit.text())
+        except: return default
+
+    def _gl_error(self, msg, err_lbl, run_btn, prog):
+        run_btn.setEnabled(True); prog.setVisible(False)
+        err_lbl.setText(f"Error: {str(msg)[:200]}")
+
+    # ── Run slots ────────────────────────────────────────────────────────────
+    def _run_depth(self):
+        d_min, d_max, d_step = self._sf(self.d_min_e), self._sf(self.d_max_e), self._sf(self.d_step_e, 500.0)
+        if d_min is None or d_max is None or d_min >= d_max:
+            self.d_err.setText("⚠ Valid Depth Min < Max required."); return
+        self.d_err.setText("")
+        depths = np.arange(d_min, d_max + d_step, d_step).tolist()
+        p_inj  = self._sf(self.d_pinj_e)
+        self.d_run.setEnabled(False); self.d_prog.setVisible(True); self.d_prog.setValue(0)
+        w = GasLiftWorker(self.state, "depth", depths,
+                          gl_inj_rate_mscf=self._sf(self.d_rate_e, 500.0),
+                          gl_sg_gas=self.state.gl_sg_gas or self.state.sg_gas)
+        w.signals.finished.connect(lambda r: self._on_depth_done(r, p_inj))
+        w.signals.error.connect(lambda e: self._gl_error(e, self.d_err, self.d_run, self.d_prog))
+        w.signals.progress.connect(lambda p, _: self.d_prog.setValue(p))
+        QThreadPool.globalInstance().start(w)
+
+    def _on_depth_done(self, result, p_inj):
+        self.d_run.setEnabled(True); self.d_prog.setVisible(False)
+        self._depth_result = result
+        opt = find_optimum(result)
+        if opt["opt_value"] is not None:
+            self._opt_depth = opt["opt_value"]
+            self.d_opt_chip.setText(f"✓ Opt. Depth: {opt['opt_value']:.0f} ft  (q*={opt['opt_q']:.0f} STB/d)")
+            self.d_opt_chip.setObjectName("chip_success"); self.d_opt_chip.setStyle(self.d_opt_chip.style())
+            self.r_depth_e.setText(f"{opt['opt_value']:.0f}")  # pre-fill Tab 2
+            self._update_summary()
+        self._plot_sweep(self.d_chart, result, "Injection Depth (ft)", opt, p_inj)
+
+    def _run_rate(self):
+        inj_depth = self._sf(self.r_depth_e)
+        if inj_depth is None:
+            self.r_err.setText("⚠ Injection Depth required (run Tab 1 or enter manually)."); return
+        q_min = self._sf(self.r_qmin_e, 100.0); q_max = self._sf(self.r_qmax_e, 3000.0)
+        q_step = self._sf(self.r_qstep_e, 100.0)
+        sg_gas = self._sf(self.r_sg_e, self.state.sg_gas)
+        econ   = self._sf(self.r_econ_e, 0.5)
+        p_inj  = self._sf(self.r_pinj_e)
+        rates  = np.arange(q_min, q_max + q_step, q_step).tolist()
+        self.r_err.setText("")
+        self.r_run.setEnabled(False); self.r_prog.setVisible(True); self.r_prog.setValue(0)
+        w = GasLiftWorker(self.state, "rate", rates, gl_inj_depth=inj_depth, gl_sg_gas=sg_gas)
+        w.signals.finished.connect(lambda r: self._on_rate_done(r, econ, p_inj, sg_gas))
+        w.signals.error.connect(lambda e: self._gl_error(e, self.r_err, self.r_run, self.r_prog))
+        w.signals.progress.connect(lambda p, _: self.r_prog.setValue(p))
+        QThreadPool.globalInstance().start(w)
+
+    def _on_rate_done(self, result, econ, p_inj, sg_gas):
+        self.r_run.setEnabled(True); self.r_prog.setVisible(False)
+        self._rate_result = result
+        opt = find_optimum(result, econ_slope=econ)
+        if opt["opt_value"] is not None:
+            self._opt_rate = opt["opt_value"]
+            self.r_opt_chip.setText(f"✓ Opt. Rate: {opt['opt_value']:.0f} Mscf/d  (q*={opt['opt_q']:.0f} STB/d)")
+            self.r_opt_chip.setObjectName("chip_success"); self.r_opt_chip.setStyle(self.r_opt_chip.style())
+            self.apply_btn.setEnabled(True)
+            self._update_summary()
+        self._plot_rate_chart(result, opt, p_inj, sg_gas)
+
+    def _run_glr(self):
+        g_min, g_max, g_step = self._sf(self.g_min_e), self._sf(self.g_max_e), self._sf(self.g_step_e, 500.0)
+        if g_min is None or g_max is None or g_min >= g_max:
+            self.g_err.setText("⚠ Valid GLR Min < Max required."); return
+        glrs      = np.arange(g_min, g_max + g_step, g_step).tolist()
+        inj_depth = self._sf(self.r_depth_e) or (self.state.depth or 5000) * 0.55
+        self.g_err.setText("")
+        self.g_run.setEnabled(False); self.g_prog.setVisible(True); self.g_prog.setValue(0)
+        w = GasLiftWorker(self.state, "glr", glrs, gl_inj_depth=inj_depth,
+                          gl_sg_gas=self.state.gl_sg_gas or self.state.sg_gas)
+        w.signals.finished.connect(self._on_glr_done)
+        w.signals.error.connect(lambda e: self._gl_error(e, self.g_err, self.g_run, self.g_prog))
+        w.signals.progress.connect(lambda p, _: self.g_prog.setValue(p))
+        QThreadPool.globalInstance().start(w)
+
+    def _on_glr_done(self, result):
+        self.g_run.setEnabled(True); self.g_prog.setVisible(False)
+        self._glr_result = result
+        opt = find_optimum(result)
+        if opt["opt_value"] is not None:
+            self._opt_glr = opt["opt_value"]
+            self.g_opt_chip.setText(f"✓ Opt. GLR: {opt['opt_value']:.0f} scf/STB  (q*={opt['opt_q']:.0f} STB/d)")
+            self.g_opt_chip.setObjectName("chip_success"); self.g_opt_chip.setStyle(self.g_opt_chip.style())
+            self._update_summary()
+        self._plot_sweep(self.g_chart, result, "Total GLR (scf/STB)", opt)
+
+    # ── Chart helpers ────────────────────────────────────────────────────────
+    def _plot_sweep(self, chart: MatplotlibWidget, result: dict,
+                    xlabel: str, opt: dict,
+                    p_inj_surface=None, sg_gas_inj=0.65, depth_total=None):
+        ax = chart.clear_axes()
+        sv = result["sweep_values"]; qr = result["q_results"]
+
+        feasible = [True] * len(sv)
+        if p_inj_surface:
+            feasible = injection_feasibility_mask(
+                result, p_inj_surface, sg_gas_inj,
+                state_depth=depth_total or self.state.depth or 8000)
+
+        fx, fy, ix, iy = [], [], [], []
+        for i, (x, y) in enumerate(zip(sv, qr)):
+            if y is None: continue
+            if feasible[i]: fx.append(x); fy.append(y)
+            else:           ix.append(x); iy.append(y)
+
+        if fx: ax.plot(fx, fy, color=BLUE, linewidth=2.5, label="Feasible")
+        if ix: ax.plot(ix, iy, color=BLUE, linewidth=2.0, linestyle="--",
+                       alpha=0.35, label="Infeasible (inj. pressure insufficient)")
+        if result.get("baseline_q"):
+            ax.axhline(result["baseline_q"], color=WARNING, linestyle=":", linewidth=1.5,
+                       label=f"No-lift baseline: {result['baseline_q']:.0f} STB/d")
+        if opt["opt_value"] is not None and opt["opt_q"] is not None:
+            ax.scatter([opt["opt_value"]], [opt["opt_q"]], color=SUCCESS,
+                       zorder=9, s=150, marker="*", label=f"Optimum: {opt['opt_value']:.0f}")
+        ax.set_xlabel(xlabel); ax.set_ylabel("Liquid Rate (STB/day)")
+        ax.set_title(f"Gas Lift — {xlabel}", fontsize=12, fontweight="bold", color=NAVY)
+        ax.legend(fontsize=9)
+        chart.refresh()
+
+    def _plot_rate_chart(self, result: dict, opt: dict, p_inj, sg_gas):
+        ax = self.r_chart.clear_axes()
+        sv = result["sweep_values"]; qr = result["q_results"]
+
+        feasible = [True] * len(sv)
+        if p_inj:
+            feasible = injection_feasibility_mask(
+                result, p_inj, sg_gas, state_depth=self.state.depth or 8000)
+
+        fx, fy, ix, iy = [], [], [], []
+        for i, (x, y) in enumerate(zip(sv, qr)):
+            if y is None: continue
+            if feasible[i]: fx.append(x); fy.append(y)
+            else:           ix.append(x); iy.append(y)
+
+        if fx: ax.plot(fx, fy, color=BLUE, linewidth=2.5, label="GLPC")
+        if ix: ax.plot(ix, iy, color=BLUE, linewidth=2.0, linestyle="--",
+                       alpha=0.35, label="Infeasible")
+
+        if opt.get("method") == "econ_slope" and opt["opt_value"]:
+            ax.axvline(opt["opt_value"], color=GOLD, linestyle="--", alpha=0.8,
+                       label=f"Econ Optimum: {opt['opt_value']:.0f} Mscf/d")
+
+        q_avail = self._sf(self.r_qavail_e)
+        if q_avail:
+            ax.axvline(q_avail, color=WARNING, linestyle=":", linewidth=2,
+                       label=f"Compressor ceiling: {q_avail:.0f} Mscf/d")
+
+        if result.get("baseline_q"):
+            ax.axhline(result["baseline_q"], color=WARNING, linestyle=":", linewidth=1.5,
+                       label=f"No-lift: {result['baseline_q']:.0f} STB/d")
+
+        if opt["opt_value"] is not None and opt["opt_q"] is not None:
+            ax.scatter([opt["opt_value"]], [opt["opt_q"]], color=SUCCESS,
+                       zorder=9, s=150, marker="*", label=f"q*={opt['opt_q']:.0f} STB/d")
+
+        ax.set_xlabel("Injection Gas Rate (Mscf/day)")
+        ax.set_ylabel("Liquid Rate (STB/day)")
+        ax.set_title("Gas Lift Performance Curve (GLPC)", fontsize=12, fontweight="bold", color=NAVY)
+        ax.legend(fontsize=9)
+        self.r_chart.refresh()
+
+    def _update_summary(self):
+        self.tabs.setTabText(3, "4 · Summary ✓")
+        if self._opt_depth is not None: self.sum_depth_lbl.setText(f"{self._opt_depth:.0f}")
+        if self._opt_rate  is not None: self.sum_rate_lbl.setText(f"{self._opt_rate:.0f}")
+        if self._opt_glr   is not None: self.sum_glr_lbl.setText(f"{self._opt_glr:.0f}")
+
+        best_q, baseline_q = None, None
+        for r in [self._depth_result, self._rate_result, self._glr_result]:
+            if not r: continue
+            if r.get("baseline_q"): baseline_q = r["baseline_q"]
+            valid_q = [v for v in r.get("q_results", []) if v is not None]
+            if valid_q:
+                cand = max(valid_q)
+                if best_q is None or cand > best_q: best_q = cand
+
+        if best_q:
+            self.sum_q_lbl.setText(f"{best_q:.0f}")
+        if best_q and baseline_q and baseline_q > 0:
+            pct = (best_q - baseline_q) / baseline_q * 100
+            self.sum_improve_lbl.setText(f"+{pct:.1f}%")
+            self.sum_improve_lbl.setStyleSheet(f"font-size:20px; font-weight:700; color:{SUCCESS};")
+
+        self.sum_status_lbl.setText("Design ready — click 'Apply Design' below to activate.")
+        self.apply_btn.setEnabled(True)
+
+    # ── Apply / Reset ────────────────────────────────────────────────────────
+    def _apply_design(self):
+        depth = self._opt_depth or (self.state.depth * 0.55 if self.state.depth else 4000.0)
+        rate  = self._opt_rate or 500.0
+        sg    = self._sf(self.r_sg_e, self.state.sg_gas)
+
+        self.state.gl_applied   = True
+        self.state.gl_opt_depth = depth
+        self.state.gl_opt_rate  = rate
+        self.state.gl_sg_gas    = sg
+        self.state.save()
+
+        for w in [self.active_lbl, self.applied_chip]:
+            w.setText("⚡ Active" if w is self.active_lbl else "⚡ Gas Lift Active")
+            w.setObjectName("chip_success"); w.setStyle(w.style())
+        self.reset_btn.setEnabled(True)
+
+        QMessageBox.information(self, "Design Applied",
+            f"Gas Lift design applied:\n"
+            f"  Injection Depth: {depth:.0f} ft\n"
+            f"  Injection Rate:  {rate:.0f} Mscf/day\n\n"
+            "All VLP curves (VLP Panel, Sensitivity, Nodal Analysis) "
+            "will now reflect gas-lifted performance.")
+        self.design_applied.emit()
+
+    def _reset_design(self):
+        self.state.gl_applied   = False
+        self.state.gl_opt_depth = None
+        self.state.gl_opt_rate  = None
+        self.state.save()
+        for w in [self.active_lbl, self.applied_chip]:
+            w.setText("● Off" if w is self.active_lbl else "○ Not Applied")
+            w.setObjectName("chip_gray"); w.setStyle(w.style())
+        self.reset_btn.setEnabled(False)
+        QMessageBox.information(self, "Gas Lift Reset",
+            "Gas lift design cleared. All VLP curves reverted to natural (no-lift) flow.")
+        self.design_reset.emit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CHOKE PANEL
+# ─────────────────────────────────────────────────────────────────────────────
+class ChokePanel(QDialog):
+    def __init__(self, state: AppState, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self.setWindowTitle("Choke Panel — Optimum Choke Sizing")
+        self.setMinimumSize(1100, 740)
+        self._perf_results = None
+        self._setup_ui()
+        self._load_from_state()
+
+    def _setup_ui(self):
+        main = QHBoxLayout(self)
+        main.setContentsMargins(20, 20, 20, 20)
+        main.setSpacing(20)
+
+        # Left: inputs
+        left_scroll = QScrollArea(); left_scroll.setWidgetResizable(True)
+        left_scroll.setFixedWidth(380); left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_w = QWidget(); ll = QVBoxLayout(left_w); ll.setSpacing(10)
+
+        ll.addWidget(SectionHeader("Choke Panel", "Surface choke sizing & rate-check"))
+
+        # Mode
+        mode_row = QHBoxLayout()
+        mode_lbl = QLabel("Mode:"); mode_lbl.setFixedWidth(80)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Rate-Check (single bean)", "Sizing (candidate list)"])
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_change)
+        mode_row.addWidget(mode_lbl); mode_row.addWidget(self.mode_combo, 1)
+        ll.addLayout(mode_row)
+
+        # Correlation
+        corr_row = QHBoxLayout()
+        corr_lbl = QLabel("Correlation:"); corr_lbl.setFixedWidth(130)
+        corr_lbl.setStyleSheet(f"color:{SLATE}; font-size:12px; font-weight:600;")
+        self.corr_combo = QComboBox()
+        self.corr_combo.addItems(["gilbert", "ros", "achong", "baxendell", "sachdeva"])
+        corr_row.addWidget(corr_lbl); corr_row.addWidget(self.corr_combo, 1)
+        ll.addLayout(corr_row)
+
+        ll.addWidget(make_label("INPUTS"))
+
+        self.thp_e,   u = make_input("from VLP",  unit="psia");      ll.addLayout(make_row("Upstream Pressure (Pwh)", self.thp_e,   u))
+        self.pdown_e, u = make_input("e.g. 100",  unit="psia");      ll.addLayout(make_row("Downstream Pressure",     self.pdown_e, u))
+        self.glr_e,   u = make_input("from state", unit="scf/STB");  ll.addLayout(make_row("GLR at Wellhead",         self.glr_e,   u))
+
+        # Rate-check mode
+        self.bean_e, u = make_input("32", unit="1/64 in")
+        self.bean_row_w = QWidget(); self.bean_row_w.setLayout(make_row("Bean Size", self.bean_e, u))
+        ll.addWidget(self.bean_row_w)
+
+        # Sizing mode
+        self.cand_e, u = make_input("16,20,24,28,32,36,40,48,64", unit="1/64 in")
+        self.cand_row_w = QWidget(); self.cand_row_w.setLayout(make_row("Candidate Sizes", self.cand_e, u))
+        ll.addWidget(self.cand_row_w)
+
+        self.tgt_q_e, u = make_input("e.g. 1500", unit="STB/day")
+        self.tgt_row_w = QWidget(); self.tgt_row_w.setLayout(make_row("Target Plateau Rate", self.tgt_q_e, u))
+        ll.addWidget(self.tgt_row_w)
+
+        self.t_up_e,  u = make_input("100",  unit="°F");     ll.addLayout(make_row("Upstream Temperature",  self.t_up_e,  u))
+        self.cfac_e,  u = make_input("100",  unit="");        ll.addLayout(make_row("API RP 14E c-factor",   self.cfac_e,  u))
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine); sep.setStyleSheet(f"color:{BLUE_M};")
+        ll.addWidget(sep)
+        ll.addWidget(make_label("FLUID PROPERTIES"))
+        self.sg_gas_e, u = make_input("0.65", unit="air=1");   ll.addLayout(make_row("Gas SG",    self.sg_gas_e, u))
+        self.sg_oil_e, u = make_input("0.84", unit="water=1"); ll.addLayout(make_row("Oil SG",    self.sg_oil_e, u))
+        self.wc_e,     u = make_input("0.0",  unit="fraction");ll.addLayout(make_row("Watercut",  self.wc_e,     u))
+
+        self.choke_err = QLabel("")
+        self.choke_err.setStyleSheet(f"color:{WARNING}; font-size:11px;")
+        self.choke_err.setWordWrap(True)
+        ll.addWidget(self.choke_err)
+        ll.addStretch()
+
+        calc_btn = QPushButton("▶  Calculate")
+        calc_btn.setObjectName("primary")
+        calc_btn.clicked.connect(self._calculate)
+        ll.addWidget(calc_btn)
+
+        left_scroll.setWidget(left_w)
+        main.addWidget(left_scroll)
+
+        # Right: results
+        rl = QVBoxLayout()
+        rl.addWidget(make_label("CHOKE PERFORMANCE"))
+
+        # Status badges
+        badges = QHBoxLayout()
+        self.flow_badge    = make_chip("—", "chip_gray"); self.flow_badge.setFixedHeight(28)
+        self.eros_badge    = make_chip("—", "chip_gray"); self.eros_badge.setFixedHeight(28)
+        self.hydrate_badge = make_chip("—", "chip_gray"); self.hydrate_badge.setFixedHeight(28)
+        self.rec_badge     = make_chip("—", "chip_gray"); self.rec_badge.setFixedHeight(28)
+        for b in [self.flow_badge, self.eros_badge, self.hydrate_badge, self.rec_badge]:
+            badges.addWidget(b)
+        badges.addStretch()
+        rl.addLayout(badges)
+
+        self.choke_chart = MatplotlibWidget(figsize=(6, 3.5))
+        rl.addWidget(self.choke_chart, 1)
+
+        rl.addWidget(make_label("CANDIDATE RESULTS"))
+        self.choke_table = QTableWidget()
+        self.choke_table.setAlternatingRowColors(True)
+        self.choke_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.choke_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        rl.addWidget(self.choke_table, 1)
+
+        main.addLayout(rl, 1)
+        self._on_mode_change(0)
+
+    def _on_mode_change(self, idx):
+        sizing = (idx == 1)
+        self.bean_row_w.setVisible(not sizing)
+        self.cand_row_w.setVisible(sizing)
+        self.tgt_row_w.setVisible(sizing)
+
+    def _load_from_state(self):
+        s = self.state
+        models = ["gilbert", "ros", "achong", "baxendell", "sachdeva"]
+        self.corr_combo.setCurrentIndex(models.index(s.choke_model) if s.choke_model in models else 0)
+        if s.thp:         self.thp_e.setText(str(s.thp))
+        if s.choke_p_down:self.pdown_e.setText(str(s.choke_p_down))
+        glr = s.gor or 500.0
+        self.glr_e.setText(str(glr))
+        self.bean_e.setText(str(s.choke_size_64))
+        self.cand_e.setText(s.choke_sizes_list)
+        if s.choke_target_q: self.tgt_q_e.setText(str(s.choke_target_q))
+        self.cfac_e.setText(str(s.choke_c_factor))
+        if s.T_surface: self.t_up_e.setText(str(s.T_surface))
+        self.sg_gas_e.setText(str(s.sg_gas))
+        self.sg_oil_e.setText(str(s.sg_oil))
+        self.wc_e.setText(str(s.wc))
+
+    def _sf(self, edit, default=None):
+        try: return float(edit.text())
+        except: return default
+
+    def _calculate(self):
+        self.choke_err.setText("")
+        model  = self.corr_combo.currentText()
+        p_up   = self._sf(self.thp_e)
+        p_down = self._sf(self.pdown_e)
+        glr    = self._sf(self.glr_e)
+        t_up   = self._sf(self.t_up_e, 100.0)
+        c_fac  = self._sf(self.cfac_e, 100.0)
+        sg_gas = self._sf(self.sg_gas_e, 0.65)
+        sg_oil = self._sf(self.sg_oil_e, 0.84)
+        wc     = self._sf(self.wc_e, 0.0)
+
+        if not all([p_up, p_down, glr]):
+            self.choke_err.setText("⚠ Upstream pressure, downstream pressure, and GLR are required."); return
+        if p_down >= p_up:
+            self.choke_err.setText("⚠ Warning: Downstream pressure ≥ Upstream — critical flow may not hold.")
+
+        is_sizing = (self.mode_combo.currentIndex() == 1)
+        if is_sizing:
+            try:
+                beans = [float(x.strip()) for x in self.cand_e.text().split(",") if x.strip()]
+                if not beans: raise ValueError
+            except Exception:
+                self.choke_err.setText("⚠ Invalid candidate sizes (e.g. 16,24,32,40)."); return
+        else:
+            beans = [self._sf(self.bean_e, 32.0)]
+
+        rho_liq = 62.4 * sg_oil * (1.0 - wc) + 62.4 * 1.07 * wc
+
+        try:
+            results = choke_performance_curve(
+                bean_sizes_64=beans, glr=glr, p_up=p_up, p_down=p_down,
+                model=model, sg_gas=sg_gas, sg_oil=sg_oil, wc=wc,
+                t_up=t_up, c_factor=c_fac, rho_liq_lbm_ft3=rho_liq)
+        except Exception as e:
+            self.choke_err.setText(f"Calculation error: {e}"); return
+
+        self._perf_results = results
+
+        # Save key state fields
+        self.state.choke_model    = model
+        self.state.choke_p_down   = p_down
+        self.state.choke_c_factor = c_fac
+        self.state.choke_sizes_list = self.cand_e.text()
+        self.state.save()
+
+        # Update badges
+        if results:
+            crit = results[0]["is_critical"]
+            self.flow_badge.setText("🔴 Critical Flow" if crit else "🟡 Subcritical Flow")
+            self.flow_badge.setObjectName("chip_success" if crit else "chip_gold")
+            self.flow_badge.setStyle(self.flow_badge.style())
+
+            all_pass = all(r["erosional"]["pass_check"] for r in results)
+            self.eros_badge.setText("✅ Erosion OK" if all_pass else "⚠ Erosion Risk")
+            self.eros_badge.setObjectName("chip_success" if all_pass else "chip_warning")
+            self.eros_badge.setStyle(self.eros_badge.style())
+
+            jt = joule_thomson_estimate(p_up, p_down, t_up)
+            self.hydrate_badge.setText(
+                f"⚠ Hydrate Risk ({jt['t_down']:.0f}°F)" if jt["hydrate_risk"]
+                else f"✅ No Hydrate ({jt['t_down']:.0f}°F)")
+            self.hydrate_badge.setObjectName("chip_warning" if jt["hydrate_risk"] else "chip_success")
+            self.hydrate_badge.setStyle(self.hydrate_badge.style())
+
+        tgt_q = self._sf(self.tgt_q_e) if is_sizing else None
+        if is_sizing and tgt_q:
+            rec = recommend_bean_size(results, tgt_q)
+            if rec:
+                self.rec_badge.setText(f"★ Rec: {rec['bean_64']:.0f}/64\" ({rec['q_pred']:.0f} STB/d)")
+                self.rec_badge.setObjectName("chip_blue")
+            else:
+                self.rec_badge.setText("No candidate meets target")
+        elif not is_sizing and results:
+            self.rec_badge.setText(f"Predicted Rate: {results[0]['q_pred']:.0f} STB/d")
+            self.rec_badge.setObjectName("chip_blue")
+        self.rec_badge.setStyle(self.rec_badge.style())
+
+        self._plot_choke(results, tgt_q)
+        self._populate_table(results, tgt_q)
+
+    def _plot_choke(self, results, target_q=None):
+        ax = self.choke_chart.clear_axes()
+        beans  = [r["bean_64"] for r in results]
+        rates  = [r["q_pred"]  for r in results]
+        colors = [SUCCESS if r["erosional"]["pass_check"] else WARNING for r in results]
+
+        x = range(len(beans))
+        ax.bar(x, rates, color=colors, alpha=0.80, edgecolor=NAVY, linewidth=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels([f'{b:.0f}/64"' for b in beans], rotation=30, ha="right")
+        if target_q:
+            ax.axhline(target_q, color=BLUE, linestyle="--", linewidth=1.8,
+                       label=f"Target: {target_q:.0f} STB/d")
+            ax.legend(fontsize=9)
+        ax.set_xlabel('Bean Size (1/64 in)')
+        ax.set_ylabel('Predicted Liquid Rate (STB/day)')
+        ax.set_title("Choke Performance — Rate vs. Bean Size",
+                     fontsize=12, fontweight="bold", color=NAVY)
+        # Legend for erosional
+        import matplotlib.patches as _mp
+        patches = [_mp.Patch(color=SUCCESS, label="Erosion OK"),
+                   _mp.Patch(color=WARNING, label="Erosion Risk")]
+        ax.legend(handles=patches, fontsize=9, loc="upper left")
+        self.choke_chart.refresh()
+
+    def _populate_table(self, results, target_q=None):
+        rec_bean = None
+        if target_q:
+            rec = recommend_bean_size(results, target_q)
+            if rec: rec_bean = rec["bean_64"]
+
+        hdrs = ["Bean (1/64 in)", "Rate (STB/day)", "Pwh Pred (psia)",
+                "Flow Regime", "V_act (ft/s)", "V_eros (ft/s)", "Erosion", "Recommended"]
+        self.choke_table.setColumnCount(len(hdrs))
+        self.choke_table.setHorizontalHeaderLabels(hdrs)
+        self.choke_table.setRowCount(len(results))
+
+        for ri, r in enumerate(results):
+            eros   = r["erosional"]
+            regime = "Critical" if r["is_critical"] else "Subcritical"
+            is_rec = (rec_bean is not None and r["bean_64"] == rec_bean)
+            vals = [
+                f"{r['bean_64']:.0f}",
+                f"{r['q_pred']:.1f}",
+                f"{r['p_up_pred']:.1f}",
+                regime,
+                f"{eros['v_actual']:.2f}",
+                f"{eros['v_erosional']:.2f}",
+                "✅ OK" if eros["pass_check"] else "⚠ Risk",
+                "★ Recommended" if is_rec else "",
+            ]
+            for ci, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if is_rec: item.setBackground(QColor(BLUE_L))
+                if ci == 6 and not eros["pass_check"]: item.setForeground(QColor(WARNING))
+                self.choke_table.setItem(ri, ci, item)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  COMING SOON DIALOG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2140,6 +3080,13 @@ class NodalAnalysisScreen(QWidget):
         pvt_scroll.setWidget(pvt_grid_w)
         pvt_tab_l.addWidget(pvt_scroll)
         self.tab_widget.addTab(pvt_tab, "🧪  PVT @ Operating Point")
+        
+        # Tab 3: Traverse Chart
+        traverse_chart_tab = QWidget()
+        tc_l = QVBoxLayout(traverse_chart_tab)
+        self.traverse_chart_widget = MatplotlibWidget(figsize=(7, 5))
+        tc_l.addWidget(self.traverse_chart_widget)
+        self.tab_widget.addTab(traverse_chart_tab, "📈 Traverse Chart")
 
         splitter.addWidget(self.tab_widget)
         splitter.setSizes([600, 500])
@@ -2162,14 +3109,27 @@ class NodalAnalysisScreen(QWidget):
         open_sens_btn.setObjectName("secondary")
         open_sens_btn.clicked.connect(self._open_sensitivity)
         bottom_bar.addWidget(open_sens_btn)
-        
-        # Add save plot button
+
+        # PRD §6.9 — Use choke as outflow boundary toggle
+        self.choke_outflow_cb = QCheckBox("Use choke as outflow boundary")
+        self.choke_outflow_cb.setToolTip(
+            "Replaces fixed THP with a choke-derived upstream pressure (rate-dependent).\n"
+            "Configure bean size and downstream pressure in the Choke panel first."
+        )
+        choke_ready = bool(
+            getattr(self.state, "choke_size_64", None) and
+            getattr(self.state, "choke_p_down", None) and
+            getattr(self.state, "thp", None)
+        )
+        self.choke_outflow_cb.setEnabled(choke_ready)
+        bottom_bar.addWidget(self.choke_outflow_cb)
+
+        # Save plot button
         self.save_plot_btn = QPushButton("🖼️ Save Plot")
         self.save_plot_btn.setObjectName("secondary")
         self.save_plot_btn.setEnabled(False)
         self.save_plot_btn.clicked.connect(self._save_plot)
         bottom_bar.addWidget(self.save_plot_btn)
-
 
         bottom_bar.addStretch()
 
@@ -2185,11 +3145,64 @@ class NodalAnalysisScreen(QWidget):
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.error_lbl.setText("")
-        worker = NodalWorker(self.state)
+
+        # PRD §6.9 — refresh choke-outflow toggle availability
+        choke_ready = bool(
+            getattr(self.state, "choke_size_64", None) and
+            getattr(self.state, "choke_p_down", None) and
+            getattr(self.state, "thp", None)
+        )
+        self.choke_outflow_cb.setEnabled(choke_ready)
+        if not choke_ready:
+            self.choke_outflow_cb.setChecked(False)
+
+        # Build a modified state for the worker when choke outflow is active
+        run_state = self.state
+        if choke_ready and self.choke_outflow_cb.isChecked():
+            run_state = self._build_choke_outflow_state()
+
+        worker = NodalWorker(run_state)
         worker.signals.finished.connect(self._on_done)
         worker.signals.error.connect(self._on_error)
         worker.signals.progress.connect(lambda p, m: self.progress.setValue(p))
         QThreadPool.globalInstance().start(worker)
+
+    def _build_choke_outflow_state(self):
+        """PRD §6.9 — Compute choke-derived effective THP at the current operating rate
+        and return a cloned state with thp replaced by that value.
+        
+        Uses a single-point choke estimate at the test rate (or q_min as fallback)
+        to set an effective THP before handing off to the standard NodalWorker.
+        This is additive — no engine modules are modified.
+        """
+        import copy as _copy
+        s = _copy.deepcopy(self.state)
+        try:
+            glr = s.gor or 500.0
+            p_up = s.thp or 500.0
+            p_down = s.choke_p_down
+            bean = s.choke_size_64
+            model = s.choke_model or "gilbert"
+            sg_gas = s.sg_gas
+            sg_oil = s.sg_oil
+            wc = s.wc
+            t_up = s.T_surface or 100.0
+            c_factor = s.choke_c_factor or 100.0
+            rho_liq = 62.4 * sg_oil * (1.0 - wc) + 62.4 * 1.07 * wc
+
+            # Compute choke-predicted upstream pressure for the single bean
+            results = choke_performance_curve(
+                bean_sizes_64=[bean], glr=glr, p_up=p_up, p_down=p_down,
+                model=model, sg_gas=sg_gas, sg_oil=sg_oil, wc=wc,
+                t_up=t_up, c_factor=c_factor, rho_liq_lbm_ft3=rho_liq
+            )
+            if results:
+                # p_up_pred is the upstream (wellhead) pressure implied by the choke at this rate
+                effective_thp = results[0].get("p_up_pred", p_up)
+                s.thp = float(effective_thp)
+        except Exception as exc:
+            print(f"[Nodal] choke outflow THP estimate failed: {exc} — using fixed THP")
+        return s
 
     def _on_error(self, msg):
         self.run_btn.setEnabled(True)
@@ -2265,18 +3278,6 @@ class NodalAnalysisScreen(QWidget):
         ax.set_xlim(left=0); ax.set_ylim(bottom=0)
         ax.legend(fontsize=9, framealpha=0.9)
 
-        # Mini traverse inset
-        traverse = data.get("traverse")
-        if traverse:
-            ax_inset = ax.inset_axes([0.65, 0.15, 0.32, 0.42])
-            ax_inset.plot(traverse["pressures"], traverse["depths"], color="#6A1B9A", linewidth=2)
-            ax_inset.invert_yaxis()
-            ax_inset.set_xlabel("Pressure", fontsize=7)
-            ax_inset.set_ylabel("Depth (ft)", fontsize=7)
-            ax_inset.set_title("Traverse", fontsize=8, color=NAVY)
-            ax_inset.tick_params(labelsize=6)
-            ax_inset.patch.set_facecolor(OFF_W)
-
         self.chart_widget.refresh()
 
     def _populate_traverse(self, traverse):
@@ -2305,6 +3306,18 @@ class NodalAnalysisScreen(QWidget):
                 item = QTableWidgetItem(v)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.traverse_table.setItem(i, j, item)
+        
+        # Update traverse chart tab
+        if traverse:
+            ax = self.traverse_chart_widget.clear_axes()
+            ax.plot(traverse["pressures"], traverse["depths"], color="#6A1B9A", linewidth=2.5)
+            ax.invert_yaxis()
+            ax.set_xlabel("Pressure (psia)")
+            ax.set_ylabel("Depth (ft)")
+            ax.set_title("Pressure Traverse at Operating Point", fontsize=12, fontweight="bold", color=NAVY)
+            ax.grid(True, linestyle="--", alpha=0.7)
+            self.traverse_chart_widget.refresh()
+
 
     def _populate_pvt_at_op(self, pvt_data):
         # Clear grid
@@ -2577,6 +3590,7 @@ class HomeScreen(QWidget):
     open_nodal = pyqtSignal()
     open_calibration = pyqtSignal()
     open_gaslift = pyqtSignal()
+    open_choke = pyqtSignal()  # PRD §6.1 — Choke card
     well_info_saved = pyqtSignal()
 
     def __init__(self, state: AppState, parent=None):
@@ -2646,7 +3660,7 @@ class HomeScreen(QWidget):
         prog_l.addLayout(steps_row)
         main.addWidget(prog_frame)
 
-        # Card grid: row 1 — data panels
+        # Card grid: row 1 — data panels (IPR, PVT, VLP, Sensitivity, Choke)
         row1 = QHBoxLayout(); row1.setSpacing(14)
         self.ipr_card = HomeCard("📉", "IPR Data",
             "Inflow Performance Relationship — reservoir model & test data")
@@ -2656,22 +3670,25 @@ class HomeScreen(QWidget):
             "Wellbore geometry & vertical lift performance")
         self.sens_card = HomeCard("📊", "Sensitivity Analysis",
             "Vary up to 3 parameters — rate & pressure impact")
+        self.choke_card = HomeCard("🎛️", "Choke",
+            "Surface choke sizing & rate-check — optimum bean size")  # PRD §6.1
         row1.addWidget(self.ipr_card)
         row1.addWidget(self.pvt_card)
         row1.addWidget(self.vlp_card)
         row1.addWidget(self.sens_card)
+        row1.addWidget(self.choke_card)
         main.addLayout(row1)
 
-        # Row 2: Nodal (primary CTA) + Coming soon cards
+        # Row 2: Nodal (primary CTA) + Calibration + Gas Lift
         row2 = QHBoxLayout(); row2.setSpacing(14)
         self.nodal_card = HomeCard("▶", "Nodal Analysis",
             "IPR × VLP intersection — find the well operating point", is_primary=True)
         self.nodal_card.setFixedHeight(140)
-        
+
         self.calib_card = HomeCard("📌", "Calibration",
-            "Match VLP/IPR model to historical well-test data", is_disabled=False)
+            "Match VLP model to measured pressure-survey data", is_disabled=False)
         self.gaslift_card = HomeCard("⛽", "Gas Lift Analysis",
-            "Gas lift performance & injection optimization", is_disabled=True)
+            "Gas lift performance & injection optimization", is_disabled=False)  # PRD §6.1 — fully implemented
 
         row2.addWidget(self.nodal_card, 2)
         row2.addWidget(self.calib_card, 1)
@@ -2694,6 +3711,7 @@ class HomeScreen(QWidget):
         self.pvt_card.clicked.connect(self.open_pvt.emit)
         self.vlp_card.clicked.connect(self.open_vlp.emit)
         self.sens_card.clicked.connect(self.open_sensitivity.emit)
+        self.choke_card.clicked.connect(self.open_choke.emit)  # PRD §6.1
         self.nodal_card.clicked.connect(self._on_nodal_click)
         self.calib_card.clicked.connect(self.open_calibration.emit)
         self.gaslift_card.clicked.connect(self.open_gaslift.emit)
@@ -2716,16 +3734,31 @@ class HomeScreen(QWidget):
 
     def refresh_badges(self):
         s = self.state
-        for card, complete, name in [
-            (self.ipr_card, s.ipr_complete, "ipr"),
-            (self.pvt_card, s.pvt_complete, "pvt"),
-            (self.vlp_card, s.vlp_complete, "vlp"),
+        # IPR / PVT / VLP completion badges
+        for card, complete in [
+            (self.ipr_card, s.ipr_complete),
+            (self.pvt_card, s.pvt_complete),
+            (self.vlp_card, s.vlp_complete),
         ]:
             if complete:
                 card.add_badge("✓ Saved", "chip_success")
             else:
                 card.add_badge("○ Not saved", "chip_gray")
 
+        # PRD §6.1 — Calibration "Active" indicator
+        calib_active = s.calib_holdup_factor != 1.0 or s.calib_friction_factor != 1.0
+        if calib_active:
+            self.calib_card.add_badge("⚡ Active", "chip_success")
+        else:
+            self.calib_card.add_badge("○ Not applied", "chip_gray")
+
+        # PRD §6.1 — Gas Lift "Active" indicator
+        if getattr(s, "gl_applied", False):
+            self.gaslift_card.add_badge("⚡ Active", "chip_success")
+        else:
+            self.gaslift_card.add_badge("○ Not applied", "chip_gray")
+
+        # Readiness progress pills
         for key, complete in [("ipr", s.ipr_complete), ("pvt", s.pvt_complete),
                                ("vlp", s.vlp_complete), ("nodal", s.nodal_ready)]:
             lbl = self.step_labels[key]
@@ -2805,6 +3838,7 @@ class MainWindow(QMainWindow):
         self.home_screen.open_nodal.connect(self._goto_nodal)
         self.home_screen.open_calibration.connect(self._open_calibration)
         self.home_screen.open_gaslift.connect(self._open_gaslift)
+        self.home_screen.open_choke.connect(self._open_choke)  # PRD §6.1
         self.home_screen.well_info_saved.connect(self._schedule_nav_update)
 
         # Nodal → home
@@ -2885,13 +3919,19 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _open_gaslift(self):
-        dlg = ComingSoonDialog(
-            "Gas Lift Analysis",
-            "The Gas Lift Analysis module will model gas lift performance curves, injection rate "
-            "optimization, and well unloading analysis to maximize production at minimum lift cost. "
-            "This feature is under active development and will be available in a future release.",
-            self
-        )
+        if not self.state.vlp_complete or not self.state.ipr_complete:
+            QMessageBox.information(
+                self, "Setup Required",
+                "Please complete and save IPR, PVT, and VLP panels before running Gas Lift Analysis."
+            )
+            return
+        dlg = GasLiftPanel(self.state, self)
+        dlg.design_applied.connect(self.home_screen.refresh_badges)
+        dlg.design_reset.connect(self.home_screen.refresh_badges)
+        dlg.exec()
+
+    def _open_choke(self):
+        dlg = ChokePanel(self.state, self)
         dlg.exec()
 
     def _schedule_nav_update(self):

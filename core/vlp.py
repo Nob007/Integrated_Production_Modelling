@@ -2,6 +2,54 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
+_H_PTS     = np.array([1e-7, 1e-6, 3e-6, 1e-5, 7.12e-5, 1e-4, 3e-4, 1e-3, 1e-2, 1e-1, 1.0])
+_HLPSI_PTS = np.array([0.03, 0.08, 0.09, 0.20, 0.44,    0.4896, 0.65, 0.80, 0.92, 0.98, 1.00])
+_LOG_H_PTS = np.log10(_H_PTS)
+
+
+def _holdup_over_psi(H):
+    """
+    HL/psi = f(H) — Hagedorn-Brown Chart 3 / Takács Fig 2-30.
+
+    Log-log digitized lookup (np.interp clamps to the endpoint values
+    outside the table range), in place of the old rational-polynomial
+    fit which severely overestimated holdup at small H.
+    """
+    H_safe = max(H, 1e-9)
+    log_H = np.log10(H_safe)
+    return float(np.interp(log_H, _LOG_H_PTS, _HLPSI_PTS))
+
+
+def _psi_correction(B):
+    """
+    psi correction factor = f(B) — Hagedorn-Brown Chart 4 / Fig 2-32.
+
+    Same three polynomial branches as before, but blended across a
+    small window around each branch boundary (B=0.025, B=0.055) so the
+    piecewise fit doesn't introduce its own small step discontinuities.
+    """
+    def branch1(b): return 27170*b**3 - 317.52*b**2 + 0.5472*b + 0.9999
+    def branch2(b): return -533.33*b**2 + 58.524*b + 0.1171
+    def branch3(b): return 2.5714*b + 1.5962
+
+    w = 0.0015  # half-width of the blend window around each boundary
+    if B <= 0.025 - w:
+        psi = branch1(B)
+    elif B <= 0.025 + w:
+        t = (B - (0.025 - w)) / (2*w)
+        psi = (1.0 - t)*branch1(B) + t*branch2(B)
+    elif B <= 0.055 - w:
+        psi = branch2(B)
+    elif B <= 0.055 + w:
+        t = (B - (0.055 - w)) / (2*w)
+        psi = (1.0 - t)*branch2(B) + t*branch3(B)
+    else:
+        psi = branch3(B)
+
+    return max(psi, 1.0)
+
+
+
 class HagedornBrown:
     """
     Calculates multiphase flow pressure gradients and VLP curves for vertical wellbores
@@ -97,10 +145,10 @@ class HagedornBrown:
 
         # Griffith-Wallis bubble-flow boundary
         LB = 1.071 - 0.2218 * (Vm ** 2) / self.tid
-        LB = max(LB, 0.25)
+        LB = max(LB, 0.13)
 
         lambda_g = Vsg / Vm          # in-situ gas void fraction (no-slip)
-        return lambda_g < LB
+        return lambda_g , LB
 
     # ------------------------------------------------------------------
     # Griffith holdup for bubble flow
@@ -156,18 +204,52 @@ class HagedornBrown:
         Returns:
             float: Liquid holdup (0.0 – 1.0).
         """
+        # # Ngv_safe = max(Ngv, 1e-6)
+
+        # # H = ((Nlv / (Ngv_safe ** 0.575))
+        # #      * (self.fp["Pr"] / 14.7) ** 0.1
+        # #      * (CNl / Nd))
+        
+        # # H = max(H, 5e-3)
+
+        # # Hl_psi = np.sqrt(
+        # #     (0.0047 + 1123.32 * H + 729489.64 * H ** 2)
+        # #     / (1.0 + 1097.1566 * H + 722153.97 * H ** 2)
+        # # )
         # Ngv_safe = max(Ngv, 1e-6)
 
+        # # 1. Calculate the correlating parameter H (The X-axis of the original chart)
         # H = ((Nlv / (Ngv_safe ** 0.575))
         #      * (self.fp["Pr"] / 14.7) ** 0.1
         #      * (CNl / Nd))
-        
-        # H = max(H, 5e-3)
+        # H_safe = max(H, 1e-6)
 
-        # Hl_psi = np.sqrt(
-        #     (0.0047 + 1123.32 * H + 729489.64 * H ** 2)
-        #     / (1.0 + 1097.1566 * H + 722153.97 * H ** 2)
-        # )
+        # # Digitized Chart for Hl/Psi to prevent polynomial crashing at mist flow
+        # chart_H = np.array([1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 0.1, 0.5,  1.0, 10.0])
+        # chart_Hl_psi = np.array([0.004, 0.008, 0.012, 0.025, 0.035, 0.07, 0.11, 0.30, 0.45, 0.82, 0.94, 1.0])
+        # Hl_psi = np.interp(H, chart_H, chart_Hl_psi)
+
+        # # B = Ngv * (Nlv ** 0.38) / (Nd ** 2.14)
+        # # H_safe = max(H, 1e-6)
+        # # Hl_psi = np.sqrt(
+        # #     (0.0047 + 1123.32 * H_safe + 729489.64 * H_safe ** 2)
+        # #     / (1.0 + 1097.1566 * H_safe + 722153.97 * H_safe ** 2)
+        # #     )
+        # B = Ngv * (Nlv ** 0.38) / (Nd ** 2.14)   # Nlv, not Nl
+        # if B <= 0.025:
+        #     psi = 27170 * B**3 - 317.52 * B**2 + 0.5472 * B + 0.9999
+        # elif B <= 0.055:
+        #     psi = -533.33 * B**2 + 58.524 * B + 0.1171
+        # else:
+        #     psi = 2.5714 * B + 1.5962
+
+        # Hl = max(0.0, min(Hl_psi * psi, 1.0))
+
+        # self.fp["rho_m"] = self.fp["rho_l"] * Hl + self.fp["rho_g"] * (1.0 - Hl)
+        # self.fp["mu_m"]  = (self.fp["mu_l"] ** Hl) * (self.fp["mu_g"] ** (1.0 - Hl))
+
+        # return Hl
+
         Ngv_safe = max(Ngv, 1e-6)
 
         # 1. Calculate the correlating parameter H (The X-axis of the original chart)
@@ -175,24 +257,17 @@ class HagedornBrown:
              * (self.fp["Pr"] / 14.7) ** 0.1
              * (CNl / Nd))
 
-        # Digitized Chart for Hl/Psi to prevent polynomial crashing at mist flow
-        # chart_H = np.array([1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 0.1, 0.5,  1.0, 10.0])
-        # chart_Hl_psi = np.array([0.004, 0.008, 0.012, 0.025, 0.035, 0.07, 0.11, 0.30, 0.45, 0.82, 0.94, 1.0])
-        # Hl_psi = np.interp(H, chart_H, chart_Hl_psi)
+        # 2. HL/psi from the digitized log-log chart lookup (replaces the old
+        #    rational-polynomial fit, which floored at ~0.217 as H->0 instead
+        #    of the correct chart value of ~0.02-0.09, and was steep/non-
+        #    monotonic across the H range typically seen along a traverse).
+        Hl_psi = _holdup_over_psi(H)
 
-        # B = Ngv * (Nlv ** 0.38) / (Nd ** 2.14)
-        H_safe = max(H, 1e-6)
-        Hl_psi = np.sqrt(
-            (0.0047 + 1123.32 * H_safe + 729489.64 * H_safe ** 2)
-            / (1.0 + 1097.1566 * H_safe + 722153.97 * H_safe ** 2)
-            )
+        # 3. psi correction factor from B, with the branch seams blended
+        #    so crossing B=0.025 or B=0.055 along the traverse doesn't
+        #    introduce its own small step discontinuity.
         B = Ngv * (Nlv ** 0.38) / (Nd ** 2.14)   # Nlv, not Nl
-        if B <= 0.025:
-            psi = 27170 * B**3 - 317.52 * B**2 + 0.5472 * B + 0.9999
-        elif B <= 0.055:
-            psi = -533.33 * B**2 + 58.524 * B + 0.1171
-        else:
-            psi = 2.5714 * B + 1.5962
+        psi = _psi_correction(B)
 
         Hl = max(0.0, min(Hl_psi * psi, 1.0))
 
@@ -220,8 +295,7 @@ class HagedornBrown:
         # self.fp velocities are already set so the second call is consistent.
         Nl, CNl, Nlv, Ngv, Nd = self.dimensionless_numbers()
 
-        if self.is_bubble_flow():
-            return self.griffith_holdup()
+        lambda_g, LB = self.is_bubble_flow()
 
         Hl = self.liquid_holdup(Nl, CNl, Nlv, Ngv, Nd)
 
@@ -235,8 +309,16 @@ class HagedornBrown:
         self.fp["rho_m"] = self.fp["rho_l"] * Hl + self.fp["rho_g"] * (1.0 - Hl)
         self.fp["mu_m"]  = (self.fp["mu_l"] ** Hl) * (self.fp["mu_g"] ** (1.0 - Hl))
 
-        return 1.0 * Hl + 0.0 * self.griffith_holdup()
-        # return Hl
+        if lambda_g<0.7*LB:
+            Hl = self.griffith_holdup()
+        elif lambda_g<LB:
+            alpha = (lambda_g - 0.7 * LB)/max(LB - 0.7 * LB, 1e-10)
+            Hl = alpha * Hl + (1.0 - alpha) * self.griffith_holdup()
+
+        self.fp["rho_m"] = self.fp["rho_l"] * Hl + self.fp["rho_g"] * (1.0 - Hl)
+        self.fp["mu_m"]  = (self.fp["mu_l"] ** Hl) * (self.fp["mu_g"] ** (1.0 - Hl))
+        # return 1.0 * Hl + 0.0 * self.griffith_holdup()
+        return Hl
 
     # ------------------------------------------------------------------
     # Friction factor  (Jain / Colebrook approximation)
@@ -285,10 +367,6 @@ class HagedornBrown:
         
         relative_roughness = self.roughness / self.tid   # dimensionless [ft/ft]
 
-    # Jain (1976) explicit approximation — accurate to ±1 % for
-    # Re ∈ [3 000, 4×10⁸] and e/D ∈ [4×10⁻⁵, 0.05].
-    # This covers virtually every wellbore multiphase flow condition,
-    # so there is no practical need to iterate Colebrook-White here.
         f = (1.14 - 2.0 * np.log10(relative_roughness + 21.25 / (Re ** 0.9))) ** -2
         x = lambda_l/ Hl ** 2
         if ((x > 1) and (x < 1.2)):
@@ -321,8 +399,9 @@ class HagedornBrown:
         gc         = 32.174
         dp_dh_fric = (2 * f * self.fp["rho_ns"] * self.fp["Vm"] ** 2) / ( gc * self.tid * 144.0)
         Ek = self.fp["Vm"] * self.fp["Vsg"] * self.fp["rho_m"] / (32.17 * P * 144 )
+        Ek = max(min(Ek, 0.99), 0.0)
 
-        dp_dz = dp_dh_el + dp_dh_fric/(1-Ek)
+        dp_dz = (dp_dh_el + dp_dh_fric)/(1-Ek)
         if return_components:
             return dp_dz, Hl, f, dp_dh_el, dp_dh_fric
         return dp_dz
@@ -332,7 +411,7 @@ class HagedornBrown:
     # ------------------------------------------------------------------
 
     def calculate_pressure_traverse(self, Pth, surface_temp, bottomhole_temp,
-                                    total_depth, step_size, Ql):
+                                    total_depth, step_size, Ql, gl_depth = 0.0, gl_rate = 0.0):
         """
         Calculates the wellbore pressure profile via Euler integration.
 
@@ -352,7 +431,18 @@ class HagedornBrown:
         current_depth = 0.0
         temp_gradient = (bottomhole_temp - surface_temp) / total_depth
 
+        formation_gor = self.fp["producing_gor"]
+
         while current_depth < total_depth:
+            Qo = Ql * (1.0 - self.wc)
+            
+            if current_depth <= gl_depth and Qo > 0:
+                injected_gor = gl_rate / Qo 
+                effective_gor = formation_gor + injected_gor
+            else:
+                effective_gor = formation_gor
+            self.fp["producing_gor"] = effective_gor
+
             next_depth   = min(current_depth + step_size, total_depth)
             actual_step  = next_depth - current_depth
             current_temp = surface_temp + temp_gradient * current_depth
@@ -614,11 +704,6 @@ class Beggs_Brill:
             weight = max(0.0, min(weight, 1.0))
             Hl = weight * hl_trans_blend + (1.0 - weight) * hl_int
         elif 0.8 * boundary < Nfr < 1.2 * boundary:
-            # ------------------------------------------------------------------
-            # COMMERCIAL FIX: Smooth out the Intermittent to Distributed cliff.
-            # Blend the holdups across a +/- 20% window of the flow regime boundary
-            # to prevent the "V-shaped" kink in the VLP curve.
-            # ------------------------------------------------------------------
             hl_int = get_Hl("intermittent")
             hl_dist = get_Hl("distributed")
             
