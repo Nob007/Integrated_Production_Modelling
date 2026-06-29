@@ -25,7 +25,14 @@ def apply_calibration_factors(model, holdup_factor: float, friction_factor: floa
 
     # Create new wrapped methods that apply the factors
     def calibrated_get_holdup(*args, **kwargs):
-        return min(original_get_holdup(*args, **kwargs) * holdup_factor, 1.0)
+        # The original get_holdup for HagedornBrown returns a tuple of values.
+        # We need to apply the factor only to the first element (Hl).
+        original_output = original_get_holdup(*args, **kwargs)
+        if isinstance(original_output, tuple):
+            original_hl, *rest = original_output
+            calibrated_hl = min(original_hl * holdup_factor, 1.0)
+            return (calibrated_hl, *rest)
+        return min(original_output * holdup_factor, 1.0)
 
     def calibrated_frictional_factor(*args, **kwargs):
         return original_frictional_factor(*args, **kwargs) * friction_factor

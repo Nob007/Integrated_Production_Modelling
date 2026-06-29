@@ -1,4 +1,4 @@
-# Nodal Analysis — Integrated Production Modelling (IPM)
+# PROPMAS - Petroleum Production Modelling & Analysis System
 
 A robust, Python-based desktop application for petroleum engineers to perform Nodal Analysis. This application calculates and visualizes the intersection of Inflow Performance Relationship (IPR) and Vertical Lift Performance (VLP) curves to find the operating point(s) of a well and diagnose flow stability.
 
@@ -25,7 +25,7 @@ A robust, Python-based desktop application for petroleum engineers to perform No
 ## 📂 Project Structure
 
 ```text
-Nodal_IPM_Project/
+PROPMAS_Project/
 │
 ├── main.py                    # The core entry point that launches the app
 │

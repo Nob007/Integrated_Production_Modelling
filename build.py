@@ -1,5 +1,5 @@
 """
-PyInstaller Build Script for IPM Suite
+PyInstaller Build Script for PROPMAS
 
 This script automates the process of building the IPM Suite application into a
 standalone executable using PyInstaller. It cleans previous builds, runs
@@ -16,8 +16,8 @@ import os
 import shutil
 import PyInstaller.__main__
 
-SPEC_FILE = "IPM_Suite.spec"
-APP_NAME = "IPM_Suite"
+SPEC_FILE = "PROPMAS.spec"
+APP_NAME = "PROPMAS"
 
 if __name__ == "__main__":
     print(f"--- Starting build for {APP_NAME} ---")

@@ -47,6 +47,12 @@ def _psi_correction(B):
         psi = branch3(B)
 
     return max(psi, 1.0)
+    # if B <= 0.025:
+    #     return max(27170*B**3 - 317.52*B**2 + 0.5472*B + 0.9999, 1.0)
+    # elif B <= 0.055:
+    #     return max(-533.33*B**2 + 58.524*B + 0.1171, 1.0)
+    # else:
+    #     return max(2.5714*B + 1.5962, 1.0)
 
 
 
@@ -95,11 +101,15 @@ class HagedornBrown:
         fo = 1.0 / (1.0 + self.wor)
         fw = self.wor  / (1.0 + self.wor)
 
+        # Ensure GLR is always available in the fluid properties dictionary
+        if "glr" not in self.fp:
+            self.fp["glr"] = self.fp.get("producing_gor", 0.0) / (1.0 + self.wor)
+
         # In-situ liquid volumetric rate  [ft³/day]
         q_liquid_insitu = 5.615 * self.Ql * (self.fp["Bo"] * fo + self.fp["Bw"] * fw)
         self.fp["Vsl"]  = q_liquid_insitu / (86400.0 * self.Ap)
 
-        free_gas_scf   = max(0.0, self.Ql * (self.fp["glr"] - self.fp["gor"] * fo))
+        free_gas_scf   = max(0.0,  (self.fp["producing_gor"] - self.fp["gor"]) * self.Ql * (1.0 - self.wc))
         q_gas_insitu   = (free_gas_scf
                           * (14.7 / self.fp["Pr"])
                           * ((self.fp["Tr"] + 460.0) / 520.0)
@@ -141,14 +151,13 @@ class HagedornBrown:
         Vsg = self.fp.get("Vsg", 0.0)
 
         if Vm <= 1e-9:
-            return False
+            return False, 0., 0.
 
-        # Griffith-Wallis bubble-flow boundary
-        LB = 1.071 - 0.2218 * (Vm ** 2) / self.tid
+        LB = 1.071 - 0.2218 * (Vm ** 2) / (self.tid*12)
         LB = max(LB, 0.13)
 
         lambda_g = Vsg / Vm          # in-situ gas void fraction (no-slip)
-        return lambda_g , LB
+        return lambda_g < LB, lambda_g, LB
 
     # ------------------------------------------------------------------
     # Griffith holdup for bubble flow
@@ -181,10 +190,7 @@ class HagedornBrown:
         Hl = 1.0 - 0.5 * (1.0 + Vm / Vs - np.sqrt(discriminant))
         Hl = max(0.0, min(Hl, 1.0))
 
-        self.fp["rho_m"] = self.fp["rho_l"] * Hl + self.fp["rho_g"] * (1.0 - Hl)
-        self.fp["mu_m"]  = (self.fp["mu_l"] ** Hl) * (self.fp["mu_g"] ** (1.0 - Hl))
-
-        return Hl
+        return max(min(Hl, 1.0), 0.0)
 
     # ------------------------------------------------------------------
     # Hagedorn-Brown holdup (slug / transition / mist)
@@ -251,30 +257,18 @@ class HagedornBrown:
         # return Hl
 
         Ngv_safe = max(Ngv, 1e-6)
+        Nl = max(min(Nl, 10.0), 1e-6)
 
-        # 1. Calculate the correlating parameter H (The X-axis of the original chart)
-        H = ((Nlv / (Ngv_safe ** 0.575))
-             * (self.fp["Pr"] / 14.7) ** 0.1
-             * (CNl / Nd))
+        H = ((Nlv / (Ngv_safe ** 0.575))* (self.fp["Pr"] / 14.7) ** 0.1 * (CNl / Nd)) if (Ngv > 0 and Nd > 0) else 0.0
 
-        # 2. HL/psi from the digitized log-log chart lookup (replaces the old
-        #    rational-polynomial fit, which floored at ~0.217 as H->0 instead
-        #    of the correct chart value of ~0.02-0.09, and was steep/non-
-        #    monotonic across the H range typically seen along a traverse).
         Hl_psi = _holdup_over_psi(H)
 
-        # 3. psi correction factor from B, with the branch seams blended
-        #    so crossing B=0.025 or B=0.055 along the traverse doesn't
-        #    introduce its own small step discontinuity.
-        B = Ngv * (Nlv ** 0.38) / (Nd ** 2.14)   # Nlv, not Nl
+        B = Ngv * (Nlv ** 0.38) / (Nd ** 2.14)  if Nd > 0 else 0.0
         psi = _psi_correction(B)
 
         Hl = max(0.0, min(Hl_psi * psi, 1.0))
 
-        self.fp["rho_m"] = self.fp["rho_l"] * Hl + self.fp["rho_g"] * (1.0 - Hl)
-        self.fp["mu_m"]  = (self.fp["mu_l"] ** Hl) * (self.fp["mu_g"] ** (1.0 - Hl))
-
-        return Hl
+        return Hl, H, Hl_psi, B, psi
 
     # ------------------------------------------------------------------
     # Combined holdup dispatcher
@@ -290,35 +284,26 @@ class HagedornBrown:
         Returns:
             float: Liquid holdup (0.0 – 1.0).
         """
-        # dimensionless_numbers() populates Vsl, Vsg, Vm — required by is_bubble_flow()
-        # liquid_holdup() calls dimensionless_numbers() again internally, but
-        # self.fp velocities are already set so the second call is consistent.
-        Nl, CNl, Nlv, Ngv, Nd = self.dimensionless_numbers()
+        Nl, CNl, Nlv, Ngv, Nd = self.dimensionless_numbers() # These are the values we need
 
-        lambda_g, LB = self.is_bubble_flow()
+        is_bubble, lambda_g, LB = self.is_bubble_flow()
 
-        Hl = self.liquid_holdup(Nl, CNl, Nlv, Ngv, Nd)
-
-        # Physical floor: holdup can never fall below the no-slip value —
-        # slip between phases can only increase liquid holdup, never decrease it.
         Cl = self.fp["Vsl"] / max(self.fp["Vm"], 1e-6)
-        Hl = max(Hl, Cl)
-
-        # Re-blend mixture properties since liquid_holdup() set them using
-        # the unfloored Hl
-        self.fp["rho_m"] = self.fp["rho_l"] * Hl + self.fp["rho_g"] * (1.0 - Hl)
-        self.fp["mu_m"]  = (self.fp["mu_l"] ** Hl) * (self.fp["mu_g"] ** (1.0 - Hl))
-
-        if lambda_g<0.7*LB:
-            Hl = self.griffith_holdup()
-        elif lambda_g<LB:
+        Hl_hagedron, H, Hl_psi, B, psi = self.liquid_holdup(Nl, CNl, Nlv, Ngv, Nd)
+        Hl_griffith = self.griffith_holdup()
+        if is_bubble and lambda_g < 0.7 * LB:
+            Hl = Hl_griffith
+        elif lambda_g>LB:
+            Hl = Hl_hagedron
+        else:
             alpha = (lambda_g - 0.7 * LB)/max(LB - 0.7 * LB, 1e-10)
-            Hl = alpha * Hl + (1.0 - alpha) * self.griffith_holdup()
+            Hl = alpha * Hl_hagedron + (1.0 - alpha) * Hl_griffith
+        Hl = max(min(Hl, 1.0), Cl)
 
         self.fp["rho_m"] = self.fp["rho_l"] * Hl + self.fp["rho_g"] * (1.0 - Hl)
         self.fp["mu_m"]  = (self.fp["mu_l"] ** Hl) * (self.fp["mu_g"] ** (1.0 - Hl))
         # return 1.0 * Hl + 0.0 * self.griffith_holdup()
-        return Hl
+        return Hl, H, Hl_psi, B, psi, Nl, Nlv, Ngv, Nd
 
     # ------------------------------------------------------------------
     # Friction factor  (Jain / Colebrook approximation)
@@ -361,21 +346,26 @@ class HagedornBrown:
         / mu_m                # [cp]
         )
 
-    # Laminar regime — exact Hagen-Poiseuille result
-        if Re < 2000:
+        if Re<=0: return 0.025
+        elif Re < 2100:
             return 64.0 / max(Re, 1.0)
         
         relative_roughness = self.roughness / self.tid   # dimensionless [ft/ft]
 
-        f = (1.14 - 2.0 * np.log10(relative_roughness + 21.25 / (Re ** 0.9))) ** -2
-        x = lambda_l/ Hl ** 2
+        # f = (1.14 - 2.0 * np.log10(relative_roughness + 21.25 / (Re ** 0.9))) ** -2
+        f = -4.0 * np.log10(
+        relative_roughness / 3.7065
+        - (5.0452 / Re) * np.log10(relative_roughness**1.1098 / 2.8257 + (7.149 / Re)**0.8981)
+        )
+        f = (1.0 / f)**2
+        x = max(lambda_l / Hl ** 2, 1e-6) if Hl > 0 else lambda_l
         if ((x > 1) and (x < 1.2)):
             s = np.log(2.2 * x - 1.2)
         else:
             s = np.log(x) / (-0.0523 + 3.182 * np.log(x) - 0.8725 * (np.log(x)) ** 2 + 0.01853 * (np.log(x)) ** 4)
     
         f = f * np.exp(s) 
-
+           # Darcy friction factor, turbulent
         return f
 
     # ------------------------------------------------------------------
@@ -392,7 +382,7 @@ class HagedornBrown:
         Returns:
             float: Total pressure gradient in psi/ft.
         """
-        Hl = self.get_holdup()
+        Hl, H, Hl_psi, B, psi, Nl, Nlv, Ngv, Nd = self.get_holdup()
         f  = self.frictional_factor(Hl)
 
         dp_dh_el   = self.fp["rho_m"] * np.cos(self.theta) / 144.0
@@ -403,7 +393,7 @@ class HagedornBrown:
 
         dp_dz = (dp_dh_el + dp_dh_fric)/(1-Ek)
         if return_components:
-            return dp_dz, Hl, f, dp_dh_el, dp_dh_fric
+            return dp_dz, Hl, f, dp_dh_el, dp_dh_fric, H, Hl_psi, B, psi, Nl, Nlv, Ngv, Nd
         return dp_dz
 
     # ------------------------------------------------------------------
@@ -431,26 +421,32 @@ class HagedornBrown:
         current_depth = 0.0
         temp_gradient = (bottomhole_temp - surface_temp) / total_depth
 
-        formation_gor = self.fp["producing_gor"]
+        formation_gor = self.fp["gor"]
 
         while current_depth < total_depth:
-            Qo = Ql * (1.0 - self.wc)
+            Qo = Ql * (1-self.wc)
             
             if current_depth <= gl_depth and Qo > 0:
-                injected_gor = gl_rate / Qo 
+                injected_gor = gl_rate / Qo
                 effective_gor = formation_gor + injected_gor
             else:
                 effective_gor = formation_gor
-            self.fp["producing_gor"] = effective_gor
 
             next_depth   = min(current_depth + step_size, total_depth)
             actual_step  = next_depth - current_depth
             current_temp = surface_temp + temp_gradient * current_depth
 
             self.update_fluid_properties(current_P, current_temp, Ql)
-            dp_dz, Hl, f, dp_dh_el, dp_dh_fric = self.calculate_gradient(current_P,return_components=True)
-            if next_depth == total_depth:
-                print(f"Holdup: {Hl} at depth {current_depth} at flow rate {Ql}")
+            dp_dz, Hl, f, dp_dh_el, dp_dh_fric, H, Hl_psi, B, psi, Nl, Nlv, Ngv, Nd = self.calculate_gradient(current_P,return_components=True)
+            # print(f"Vsg: {self.fp["Vsg"]}, Hl: {Hl}, gor: {self.fp["gor"]}, producing GLR: {self.fp["producing_glr"]} at depth: {current_depth}, Ql: {Ql}")
+            
+            # Print the detailed debug line at the last depth step for the current flow rate
+            # if next_depth == total_depth:
+            #     # lambda_g, LB = self.is_bubble_flow()
+            #     # Hl, H, Hl_psi, B, psi = self.liquid_holdup(*self.dimensionless_numbers())
+            #     # Cl = self.fp["Vsl"] / max(self.fp["Vm"], 1e-6)
+            #     print(f"Ql={Ql:.2f} Depth={next_depth:.2f} Vsl={self.fp['Vsl']:.3f} Vsg={self.fp['Vsg']:.3f} gor={self.fp['gor']:.1f} glr={self.fp['glr']:.1f} Nl={Nl:.4f} Nlv={Nlv:.4f} Ngv={Ngv:.4f} Nd={Nd:.4f} H={H:.5f} B={B:.5f} Hl_psi={Hl_psi:.4f} psi={psi:.4f} Hl={Hl:.5f} friction_loss:{dp_dh_fric:.5f} hydro_loss:{dp_dh_el:.5f} total_gradient:{dp_dz:.5f}")
+
             current_P += dp_dz * actual_step
             current_depth = next_depth
 

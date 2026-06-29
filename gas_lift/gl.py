@@ -124,9 +124,14 @@ def apply_gas_lift_design(
             elif hasattr(gl_obj, "update_fluid_properties"):
                 gl_obj.update_fluid_properties(current_P, current_temp, Ql)
 
-            dp_dz, Hl, f, dp_h, dp_f = gl_obj.calculate_gradient(
-                current_P, return_components=True
-            )
+            # The calculate_gradient method in HagedornBrown requires Ql, but Beggs_Brill does not.
+            # We check the method signature to pass it only when needed.
+            import inspect
+            sig = inspect.signature(gl_obj.calculate_gradient)
+            if 'Ql' in sig.parameters:
+                dp_dz, Hl, f, dp_h, dp_f, *_ = gl_obj.calculate_gradient(current_P, Ql, return_components=True)
+            else:
+                dp_dz, Hl, f, dp_h, dp_f = gl_obj.calculate_gradient(current_P, return_components=True)
 
             current_P += dp_dz * actual_step
             current_depth = next_depth
@@ -276,7 +281,7 @@ def compute_glpc(
             # Convert total GLR to injection rate:
             #   injected_gor = total_glr - natural_gor  (scf/STB)
             #   injection_rate_mscf = injected_gor * Ql_oil / 1000
-            # Ql_oil is unknown at this point so use state test rate as proxy
+            # Ql_oil is unknown at this point, so use state test rate as a proxy
             natural_gor = getattr(state, "gor", 500.0) or 500.0
             q_proxy = getattr(state, "Qo_test", 1000.0) or 1000.0
             injected_gor = max(0.0, float(val) - natural_gor)

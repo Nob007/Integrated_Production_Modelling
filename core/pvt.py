@@ -24,11 +24,7 @@ class BlackOilPVT:
         self.sg_w = sg_water
         self.wc = watercut
 
-        # BUG FIX 1: Guard against division by zero at watercut = 1.0.
-        # wor = wc / (1 - wc) blows up at full water production.
         self.wor = watercut / max(1.0 - watercut, 1e-9)
-
-        # Calculate API gravity (used in almost all oil correlations)
         self.api = (141.5 / self.sg_o) - 131.5
 
     def get_pseudo_critical(self):
@@ -82,16 +78,11 @@ class BlackOilPVT:
             f = (1.0 + c1*rho_r + c2*(rho_r**2) - c3*(rho_r**5) +
                  c4*(rho_r**2)*(1.0 + A11*(rho_r**2))*term_exp - (0.27 * Ppr / (rho_r * Tpr)))
 
-            # BUG FIX 2: The analytical derivative of the DAK EOS c4 term was wrong.
-            # Differentiating c4*rho^2*(1 + A11*rho^2)*exp(-A11*rho^2) w.r.t. rho gives:
-            #   2*c4*rho*(1 + A11*rho^2 - A11^2*rho^4)*exp(-A11*rho^2)
-            # The original code contained a spurious -A11*rho^3 term inside the bracket,
-            # which caused Newton-Raphson to converge to a slightly wrong root.
-            df = (c1 + 2.0*c2*rho_r - 5.0*c3*(rho_r**4) +
-                  2.0*c4*rho_r*(1.0 + A11*(rho_r**2) - A11**2*(rho_r**4))*term_exp +
-                  (0.27 * Ppr / ((rho_r**2) * Tpr)))
+            df_drho = (c1 + 2 * c2 * rho_r - 5 * c3 * rho_r**4 +
+                       2 * c4 * rho_r * (1 + A11 * rho_r**2 - (A11**2) * rho_r**4) * term_exp +
+                       (0.27 * Ppr) / (Tpr * rho_r**2))
 
-            rho_r_new = rho_r - f / df
+            rho_r_new = rho_r - f / df_drho
 
             if abs(rho_r_new - rho_r) < tolerance:
                 z_factor = 0.27 * Ppr / (rho_r_new * Tpr)
@@ -150,7 +141,7 @@ class BlackOilPVT:
             float: Oil Formation Volume Factor (Bo) in bbl/STB.
         """
         F = Rs * np.sqrt(self.sg_g / self.sg_o) + 1.25 * T
-        bo_sat = 0.9759 + 0.00012 * (F ** 1.175)
+        bo_sat = 0.972 + 1.47e-4 * F**1.175
 
         if P <= Pb:
             return bo_sat
@@ -305,7 +296,7 @@ class BlackOilPVT:
             sigma_dead = sigma_68 - (T - 68) * ((sigma_68 - sigma_100) / 32.0)
 
         sigma_dead = max(sigma_dead, 1.0)
-        sigma_live = sigma_dead * np.exp(-0.0002 * P)
+        sigma_live = sigma_dead * np.exp(-0.00255 * P**0.56)
         return max(sigma_live, 1.0)
 
     def calc_surface_tension_water(self, T):
@@ -331,11 +322,6 @@ class BlackOilPVT:
         Returns:
             float: M (lbm/STB liquid), dimensionless in context of Re formula.
         """
-        # BUG FIX 4: GLR conversion was wrong. GLR (gas per STB *liquid*) equals
-        # GOR (gas per STB *oil*) multiplied by the oil fraction (1 - wc), i.e.:
-        #   glr = gor * (1 - wc) = gor / (1 + wor)
-        # The original code used gor / (1 + wc), which is dimensionally incorrect
-        # and over-estimates GLR at any nonzero watercut.
         glr = gor / (1.0 + self.wor)
         return (self.sg_o * 350.52 / (1 + self.wor)
                 + self.sg_w * 350.52 * self.wor / (1 + self.wor)
@@ -349,6 +335,20 @@ class BlackOilPVT:
         a = 0.00091 * T_res - 0.0125 * self.api
         rsb = self.sg_g * (((Pb / 18.2) + 1.4) * (10 ** -a)) ** 1.2048
         return rsb
+    
+    def solution_gor(self, p, T):
+
+        y = (
+        0.00091 * T
+        - 0.0125 * self.api
+        )
+
+        Rs = self.sg_g * (
+        ((p / 18.2) + 1.4)
+        / (10 ** y)
+        ) ** (1.0 / 0.83)
+
+        return max(Rs, 0.0)
     
     def rsb_from_test(self, Rs_test, Pwf_test, Pb, T):
         """
@@ -385,7 +385,12 @@ class BlackOilPVT:
         """
         Pb = Pb if Pb!=0 else self.calc_bubble_point(T, Rsb)
 
-        Rs = self.calc_rs(P, T, Pb, Rsb)
+        if P < Pb:
+            Rs = self.solution_gor(P, T)
+            Rs = min(Rs,producing_gor)
+        else:
+            Rs = producing_gor
+            
         Z = self.calculate_dak_z_factor(P, T, self.sg_g)
         M = self.calc_M(Rs)
 
@@ -410,6 +415,7 @@ class BlackOilPVT:
         rho_l = rho_o * fo_insitu + rho_w * fw_insitu
         mu_l = mu_o * fo + mu_w * fw
         sigma_l = sigma_o * fo + sigma_w * fw
+        producing_glr = producing_gor * (1.0 - self.wc)
 
         return {
             "M": M,
@@ -417,12 +423,13 @@ class BlackOilPVT:
             "Rsb": Rsb,
             "producing_gor": producing_gor, # Lock the true UI input here
             "gor": Rs,
-            "glr": producing_gor / (1.0 + self.wor), # Proper constant GLR
+            "producing_glr": producing_glr, # Proper constant GLR
             "rho_l": rho_l,
             "rho_g": self.calc_density_gas(P, T, Z),
             "mu_l": mu_l,
             "mu_g": self.calc_viscosity_gas(P, T, Z),
             "sigma_l": sigma_l,
+            "sigma_o": sigma_o,
             "Bo": Bo,
             "Bg": Bg,
             "Bw": Bw,

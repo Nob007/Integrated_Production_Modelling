@@ -1,5 +1,5 @@
 """
-IPM Suite — Nodal Analysis Desktop App
+PROPMAS - Petroleum Production Modelling & Analysis System
 PyQt6 GUI implementing PRD v2.0
 Engine modules (ipr, pvt, vlp, solver_other) are used unmodified.
 """
@@ -568,6 +568,13 @@ class VLPWorker(BaseWorker):
                 self.signals.error.emit(f"VLP build error: {err}")
                 return
 
+            # Calculate Rsb to pass to the updated traverse method
+            Pb = s.Pb or 2000.0
+            gor = s.gor or 500.0
+            T_bh = s.T_bh or 180.0
+            Rsb = pvt.calc_true_rsb(Pb, T_bh)
+            if Rsb <= 0: Rsb = gor
+
             rates = np.arange(s.q_min, s.q_max_sweep + s.q_step, s.q_step)
             pwfs = []
             total = len(rates)
@@ -612,8 +619,13 @@ class NodalWorker(BaseWorker):
                 self.signals.error.emit(f"VLP error: {err}")
                 return
 
+            # Calculate Rsb for VLP parameters
+            Pb = s.Pb or 2000.0
+            T_bh = s.T_bh or 180.0
+            Rsb = pvt.calc_true_rsb(Pb, T_bh)
+            if Rsb <= 0: Rsb = s.gor or 500.0
             vlp_params = {
-                "Pth": s.thp, "surface_temp": s.T_surface,
+                "Pth": s.thp, "surface_temp": s.T_surface, "Rsb": Rsb,
                 "bottomhole_temp": s.T_bh, "depth": s.depth,
                 "step_size": s.dz_step,
             }
@@ -626,7 +638,7 @@ class NodalWorker(BaseWorker):
             self.signals.progress.emit(60, "Computing curves…")
 
             # Build IPR curve
-            q_ipr = np.linspace(0, ipr_obj.q_max, 100)
+            q_ipr = np.linspace(0, ipr_obj.q_max, 60)
             p_ipr = [ipr_obj.calculate_Pwf(q) for q in q_ipr]
 
             # Build VLP curve (fast scan)
@@ -662,7 +674,7 @@ class NodalWorker(BaseWorker):
                     # PVT at operating point
                     Pb = s.Pb or 2000.0
                     gor = s.gor or 500.0
-                    Rsb = pvt.calc_true_rsb(Pb, s.T_bh)
+                    Rsb = pvt.calc_true_rsb(Pb, s.T_bh or 180.0)
                     if Rsb <= 0: Rsb = gor
                     pvt_at_op = pvt.fluid_properties_dict(
                         result.stable_point.pwf, s.T_bh, Rsb, gor, Pb
@@ -737,8 +749,12 @@ class SensitivityWorker(BaseWorker):
                             p_vlp.append(float("nan"))
 
                     # Operating point
+                    Pb = s.Pb or 2000.0
+                    T_bh = s.T_bh or 180.0
+                    Rsb = pvt.calc_true_rsb(Pb, T_bh)
+                    if Rsb <= 0: Rsb = s.gor or 500.0
                     vlp_params = {
-                        "Pth": s.thp, "surface_temp": s.T_surface,
+                        "Pth": s.thp, "surface_temp": s.T_surface, "Rsb": Rsb,
                         "bottomhole_temp": s.T_bh, "depth": s.depth,
                         "step_size": s.dz_step,
                     }
@@ -790,6 +806,11 @@ class CalibrationWorker(BaseWorker):
 
             # Define traverse params for the calibrator
             # Use a representative rate for calibration, e.g., the test rate
+            Pb = s.Pb or 2000.0
+            T_bh = s.T_bh or 180.0
+            gor = s.gor or 500.0
+            Rsb = pvt.calc_true_rsb(Pb, T_bh)
+            if Rsb <= 0: Rsb = gor
             q_calib = s.Qo_test or 1000.0
             traverse_params = {
                 "Pth": s.thp, "surface_temp": s.T_surface,
@@ -989,19 +1010,16 @@ class IPRPanel(QDialog):
         # Fetkovich-specific inputs
         self.q_test2_edit, qt2_unit = make_input("e.g. 600", unit="STB/day")
         self.q_test2_edit.textChanged.connect(self._schedule_recompute)
-        self.q_test2_row_widget = QWidget()
-        self.q_test2_row_widget.setLayout(make_row("Test Rate 2", self.q_test2_edit, qt2_unit))
+        self.q_test2_row_widget = QWidget(); self.q_test2_row_widget.setLayout(make_row("Test Rate 2", self.q_test2_edit, qt2_unit))
         left_layout.addWidget(self.q_test2_row_widget)
 
         self.pwf_test2_edit, pwft2_unit = make_input("e.g. 1000", unit="psia")
         self.pwf_test2_edit.textChanged.connect(self._schedule_recompute)
-        self.pwf_test2_row_widget = QWidget()
-        self.pwf_test2_row_widget.setLayout(make_row("Test Pwf 2", self.pwf_test2_edit, pwft2_unit))
+        self.pwf_test2_row_widget = QWidget(); self.pwf_test2_row_widget.setLayout(make_row("Test Pwf 2", self.pwf_test2_edit, pwft2_unit))
         left_layout.addWidget(self.pwf_test2_row_widget)
 
         self.n_edit, n_unit = make_input("e.g. 0.8", unit="")
-        self.n_row_widget = QWidget()
-        self.n_row_widget.setLayout(make_row("Fetkovich Exponent (n)", self.n_edit, n_unit))
+        self.n_row_widget = QWidget(); self.n_row_widget.setLayout(make_row("Fetkovich Exponent (n)", self.n_edit, n_unit))
         left_layout.addWidget(self.n_row_widget)
 
         # Separator
@@ -1116,7 +1134,7 @@ class IPRPanel(QDialog):
                 temp_comp_ipr = composite_ipr(Pr, Pb, q_test, Pwf_test)
                 J = temp_comp_ipr.J
                 n = inputs.get("n") or 1.0
-                ipr = composite_fetkovich_ipr(Pr, Pb, q_test, Pwf_test, J, n=n)
+                ipr = composite_fetkovich_ipr(Pr, Pb, q_test, Pwf_test, J=J, n=n)
             else:
                 raise ValueError(f"Unknown IPR model: {model}")
 
@@ -1613,7 +1631,8 @@ class VLPPanel(QDialog):
         ax.set_xlabel("Liquid Rate, q (STB/day)")
         ax.set_ylabel("Flowing BHP, Pwf (psia)")
         ax.set_title("VLP — Vertical Lift Performance", fontsize=12, fontweight="bold", color=NAVY)
-        ax.legend()
+        if valid:
+            ax.legend()
         self.chart.refresh()
 
     def _on_vlp_error(self, msg):
@@ -1981,7 +2000,7 @@ class CalibrationPanel(QDialog):
         main.addLayout(right_l, 1)
 
         # Set initial state for clear button
-        is_calibrated = self.state.calib_holdup_factor != 1.0 or self.state.calib_friction_factor != 1.0
+        is_calibrated = bool(self.state.calib_holdup_factor != 1.0 or self.state.calib_friction_factor != 1.0)
         self.clear_btn.setVisible(is_calibrated)
 
     def _run(self):
@@ -2052,7 +2071,8 @@ class CalibrationPanel(QDialog):
         ax.set_xlabel("Pressure (psia)")
         ax.set_ylabel("Depth (ft)")
         ax.set_title("Pressure Traverse Calibration", fontsize=12, fontweight="bold", color=NAVY)
-        ax.legend()
+        if data.get("original_traverse") or data.get("calibrated_traverse"):
+            ax.legend()
         self.chart.refresh()
 
     def _apply_factors(self):
@@ -3193,8 +3213,8 @@ class NodalAnalysisScreen(QWidget):
             # Compute choke-predicted upstream pressure for the single bean
             results = choke_performance_curve(
                 bean_sizes_64=[bean], glr=glr, p_up=p_up, p_down=p_down,
-                model=model, sg_gas=sg_gas, sg_oil=sg_oil, wc=wc,
-                t_up=t_up, c_factor=c_factor, rho_liq_lbm_ft3=rho_liq
+                model=model, sg_gas=sg_gas, sg_oil=sg_oil, wc=wc, t_up=t_up,
+                c_factor=c_factor, rho_liq=rho_liq
             )
             if results:
                 # p_up_pred is the upstream (wellhead) pressure implied by the choke at this rate
@@ -3606,9 +3626,9 @@ class HomeScreen(QWidget):
 
         # Header
         header = QHBoxLayout()
-        title_lbl = QLabel("IPM Suite")
+        title_lbl = QLabel("PROPMAS")
         title_lbl.setStyleSheet(f"font-size: 28px; font-weight: 700; color: {NAVY};")
-        subtitle_lbl = QLabel("Integrated Production Modelling — Nodal Analysis")
+        subtitle_lbl = QLabel("Analysis - Modelling - Production")
         subtitle_lbl.setStyleSheet(f"font-size: 13px; color: {SLATE};")
         header_left = QVBoxLayout()
         header_left.addWidget(title_lbl)
@@ -3706,6 +3726,16 @@ class HomeScreen(QWidget):
         status_l.addWidget(self.status_lbl)
         main.addWidget(status_frame)
 
+        # Add About Us button to the status bar
+        status_l.addStretch()
+        about_btn = QPushButton("About Us")
+        about_btn.setObjectName("secondary")
+        about_btn.setToolTip("Show information about the application and developer.")
+        about_btn.clicked.connect(self._show_about_dialog)
+        status_l.addWidget(about_btn)
+
+
+
         # Connect signals
         self.ipr_card.clicked.connect(self.open_ipr.emit)
         self.pvt_card.clicked.connect(self.open_pvt.emit)
@@ -3718,6 +3748,17 @@ class HomeScreen(QWidget):
 
         self.well_id_edit.setText(self.state.well_id or "")
         self.field_name_edit.setText(self.state.field_name or "")
+
+    def _show_about_dialog(self):
+        """Displays the 'About Us' information dialog."""
+        about_text = (
+            "Hello, I am Nob007 (Soumik Dutta), this software is an open-source implementation of "
+            "Nodal Analysis and Gas Lift Design, 'PROPMAS' - Petroleum Production Modelling and Analysis System.\n\n"
+            "Feel free to report any issues and thank you for using the software!"
+        )
+        QMessageBox.information(self, "About PROPMAS", about_text)
+
+
     def _on_nodal_click(self):
         if self.state.nodal_ready:
             self.open_nodal.emit()
@@ -3816,7 +3857,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.state = AppState()
         self.state.load()
-        self.setWindowTitle("IPM Suite — Nodal Analysis")
+        self.setWindowTitle("PROPMAS - Analysis - Modelling - Production")
         self.setMinimumSize(1200, 800)
         self._setup_ui()
 
@@ -3852,7 +3893,7 @@ class MainWindow(QMainWindow):
         nav.setStyleSheet(f"background:{NAVY};")
         nav_l = QHBoxLayout(nav)
         nav_l.setContentsMargins(16, 0, 16, 0)
-        app_name = QLabel("Integrated Production Modelling")
+        app_name = QLabel("PROPMAS")
         app_name.setStyleSheet(f"color:{WHITE}; font-size:16px; font-weight:700;")
         nav_l.addWidget(app_name)
         nav_l.addStretch()
@@ -3946,8 +3987,8 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(APP_QSS)
-    app.setApplicationName("IPM Suite")
-    app.setOrganizationName("IPM")
+    app.setApplicationName("PROPMAS")
+    app.setOrganizationName("Nob007 (Soumik Dutta)")
 
     # High-DPI
     try:
@@ -3961,3 +4002,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Developed by: Nob007 (Soumik Dutta)
+# This application is for educational and demonstrative purposes.
+# Always validate results with commercial software and engineering judgment.

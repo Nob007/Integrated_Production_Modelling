@@ -1188,14 +1188,14 @@ class TitleBar(QWidget):
         lay.addWidget(ico)
 
         # App name
-        title = QLabel("Nodal Analysis")
+        title = QLabel("PROPMAS")
         title.setStyleSheet(
             "color: #FFFFFF; font-size: 16pt; font-weight: 700; "
             "background: transparent;")
         lay.addWidget(title)
 
         # Subtitle
-        sub = QLabel("Integrated Production Modelling")
+        sub = QLabel("Analysis - Modelling - Production")
         sub.setStyleSheet(
             "color: #000000; font-size: 10pt; "
             "background: transparent; margin-left: 6px;"
@@ -1272,8 +1272,7 @@ class Sidebar(QScrollArea):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(
-            "Integrated Production Modelling — Nodal Analysis")
+        self.setWindowTitle("PROPMAS - Analysis - Modelling - Production")
         self.setMinimumSize(1280, 800)
         self._pool = QThreadPool.globalInstance()
 
@@ -1468,7 +1467,7 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("Nodal Analysis — IPM")
+    app.setApplicationName("PROPMAS")
     app.setApplicationVersion("1.0")
     app.setStyle("Fusion")     # crisp cross-platform look; QSS overrides colours
     app.setStyleSheet(QSS)

@@ -236,7 +236,8 @@ class fetkovich_ipr:
         self.J = (self.q_test * 2 * self.Pb) / ((self.Pr**2 - self.Pwf_test**2)**self.n)
 
     def _calculate_exponent(self):
-        n = (np.log(self.q_test) - np.log(self.q_test2))/(np.log(self.Pr**2 - self.Pwf_test**2) - (np.log(self.Pr**2 - self.Pwf_test2**2) ))
+
+        n = (np.log(self.q_test / self.q_test2)) / (np.log((self.Pr**2 - self.Pwf_test**2) / (self.Pr**2 - self.Pwf_test2**2)))
         if n < 0.5 or n > 1.0:
             print(
             f"Calculated Fetkovich exponent (n = {n:.2f}) falls outside the physical "

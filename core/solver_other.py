@@ -140,7 +140,7 @@ def _build_vlp_evaluator(vlp_model, vlp_params: dict):
             bottomhole_temp = vlp_params["bottomhole_temp"],
             total_depth     = vlp_params["depth"],
             step_size       = vlp_params["step_size"],
-            Ql              = q,
+            Ql              = q
         )
         return float(pressures[-1])
     return _vlp
