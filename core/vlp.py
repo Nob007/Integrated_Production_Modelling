@@ -584,6 +584,11 @@ class Beggs_Brill:
         fo = (1.0 - self.wc)
         fw = self.wc
 
+        # Ensure GLR is always available in the fluid properties dictionary
+        # (mirrors the same safety patch in HagedornBrown.dimensionless_numbers)
+        if "glr" not in self.fp:
+            self.fp["glr"] = self.fp.get("producing_gor", 0.0) * fo
+
         q_liquid_insitu = 5.615 * self.Ql * (self.fp["Bo"] * fo + self.fp["Bw"] * fw)
         self.fp["Vsl"] = q_liquid_insitu / (86400.0 * self.Ap)
 
@@ -807,8 +812,8 @@ class Beggs_Brill:
             actual_step  = next_depth - current_depth
             current_temp = surface_temp + temp_gradient * current_depth
 
-            self.update_fluid_properties(current_P, current_temp, Ql)
-            dp_dz, Hl, f, dp_dh_el, dp_dh_fric, H, Hl_psi, B, psi, Nl, Nlv, Ngv, Nd = self.calculate_gradient(current_P,return_components=True)
+            self._update_fluid_properties(current_P, current_temp, Ql)
+            dp_dz, Hl, f, dp_dh_el, dp_dh_fric = self.calculate_gradient(current_P, return_components=True)
             # print(f"Vsg: {self.fp["Vsg"]}, Hl: {Hl}, gor: {self.fp["gor"]}, producing GLR: {self.fp["producing_glr"]} at depth: {current_depth}, Ql: {Ql}")
             
             # Print the detailed debug line at the last depth step for the current flow rate
@@ -1389,6 +1394,11 @@ class DunsRos:
         """Calculates in-situ superficial velocities (Vsl, Vsg) and no-slip liquid holdup (Cl)."""
         fo = (1.0 - self.wc)
         fw = self.wc
+
+        # Ensure GLR is always available in the fluid properties dictionary
+        # (mirrors the same safety patch in HagedornBrown.dimensionless_numbers)
+        if "glr" not in self.fp:
+            self.fp["glr"] = self.fp.get("producing_gor", 0.0) * fo
 
         # Liquid flow rate in situ (ft3/D) converted to ft/sec
         q_liquid_insitu = 5.615 * self.Ql * (self.fp["Bo"] * fo + self.fp["Bw"] * fw)
